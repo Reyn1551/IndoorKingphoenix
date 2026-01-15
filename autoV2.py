@@ -216,44 +216,58 @@ def gen_frames():
             h, w, _ = frame.shape
             roi = frame[int(h/2):h, 0:w] # ROI Setengah Bawah
             
-            # AI VISION
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+# --- NEW ROBUST VISION BLOCK ---
             
-            # STEP 1: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            # This equalizes light so dark areas (shadows) and bright areas (glare) are leveled out.
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            gray = clahe.apply(gray)
+            # 1. Convert BGR to HSV (Hue, Saturation, Value)
+            # HSV is much better at separating "Color" from "Brightness"
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             
-            # STEP 2: Heavy Blur to reduce noise
-            blur = cv2.GaussianBlur(gray, (9, 9), 0)
-
-            # STEP 3: Adaptive Thresholding (Better than Global Threshold)
-            # Instead of one number (80), it calculates the threshold for every small region.
-            if IS_BLACK_LINE:
-                # THRESH_BINARY_INV because we want the Black Line to become White (255) in the mask
-                thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
-                                             cv2.THRESH_BINARY_INV, 21, 5)
-            else:
-                thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
-                                             cv2.THRESH_BINARY, 21, 5)
-
-            # STEP 4: MORPHOLOGICAL CLOSING (The Glare Fix)
-            # This connects broken parts of the line caused by reflection
-            kernel = np.ones((15, 15), np.uint8) 
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            # 2. Define "Black" Range
+            # We don't care about Color (Hue) or Saturation (S).
+            # We ONLY care that Brightness (V) is very low.
+            # lower_black = [0, 0, 0]
+            # upper_black = [180, 255, 60] <-- The '60' is your sensitivity. 
+            # If it detects shadows, LOWER this to 40 or 30.
+            lower_black = np.array([0, 0, 0])
+            upper_black = np.array([180, 255, 60]) 
             
-            # OPTIONAL: Erode slightly to remove random noise dots on the floor
-            thresh = cv2.erode(thresh, np.ones((3,3), np.uint8), iterations=1)
-
-            contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            best_cnt = None; max_area = 0
+            mask = cv2.inRange(hsv, lower_black, upper_black)
+            
+            # 3. Morphological OPEN (The Noise Killer)
+            # "Open" performs Erosion (eats away small pixels) then Dilation.
+            # This completely removes small noise specks while keeping the big line.
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
+            # 4. OPTIONAL: Dilate back up to fill holes in the line
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            
+            # (Use 'mask' for findContours instead of 'thresh')
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            
+            best_cnt = None
+            max_area = 0
             
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 1000: continue
+                
+                # 5. STRICTER SIZE FILTER
+                # Increase this from 1000 to 3000 to ignore "blobs" that are too small to be the line
+                if area < 3000: 
+                    continue
+                
                 x, y, bw, bh = cv2.boundingRect(cnt)
-                if (float(bh)/bw) > 0.8: 
-                    if area > max_area: max_area = area; best_cnt = cnt
+                
+                # 6. SHAPE FILTER (Aspect Ratio)
+                # A line is usually long/tall (in the camera view). 
+                # Noise is usually square/round.
+                # We check if the blob is "tall" enough relative to its width?
+                # (You might need to adjust this depending on if your line is horizontal or vertical in the frame)
+                # if (float(bh)/bw) < 0.5: continue # Example: Ignore wide horizontal blobs
+                
+                if area > max_area:
+                    max_area = area
+                    best_cnt = cnt
             
             line_detected = False
             command_vx = 0.0; command_vy = 0.0
