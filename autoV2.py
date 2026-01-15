@@ -218,10 +218,32 @@ def gen_frames():
             
             # AI VISION
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            thresh_val = 80
-            if IS_BLACK_LINE: _, thresh = cv2.threshold(blur, thresh_val, 255, cv2.THRESH_BINARY_INV)
-            else: _, thresh = cv2.threshold(blur, thresh_val, 255, cv2.THRESH_BINARY)
+            
+            # STEP 1: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            # This equalizes light so dark areas (shadows) and bright areas (glare) are leveled out.
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+            
+            # STEP 2: Heavy Blur to reduce noise
+            blur = cv2.GaussianBlur(gray, (9, 9), 0)
+
+            # STEP 3: Adaptive Thresholding (Better than Global Threshold)
+            # Instead of one number (80), it calculates the threshold for every small region.
+            if IS_BLACK_LINE:
+                # THRESH_BINARY_INV because we want the Black Line to become White (255) in the mask
+                thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                             cv2.THRESH_BINARY_INV, 21, 5)
+            else:
+                thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                             cv2.THRESH_BINARY, 21, 5)
+
+            # STEP 4: MORPHOLOGICAL CLOSING (The Glare Fix)
+            # This connects broken parts of the line caused by reflection
+            kernel = np.ones((15, 15), np.uint8) 
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            
+            # OPTIONAL: Erode slightly to remove random noise dots on the floor
+            thresh = cv2.erode(thresh, np.ones((3,3), np.uint8), iterations=1)
 
             contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             best_cnt = None; max_area = 0
