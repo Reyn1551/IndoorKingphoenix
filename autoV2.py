@@ -280,6 +280,7 @@ def gen_frames():
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + cv2.imencode('.jpg', combined)[1].tobytes() + b'\r\n')
 
 # --- WEB UI ---
+
 @app.route('/status')
 def status(): return jsonify(web_data)
 
