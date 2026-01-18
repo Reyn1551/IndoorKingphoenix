@@ -341,7 +341,7 @@ def gen_frames():
                 cv2.drawContours(roi, [best_cnt], -1, (0,255,255), 2)
                 
                 # PID
-                error_x = cx_scr - cx 
+                error_x = cx - cx_scr
                 if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
                 
                 kp = CONFIG["control"].get("pid_kp", 0.005)
