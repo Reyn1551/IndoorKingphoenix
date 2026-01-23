@@ -23,15 +23,8 @@ from pyzbar.pyzbar import decode
 
 import logging
 
-# 1. Create a filter class that ignores logs containing "/video_feed"
-class NoVideoFeedFilter(logging.Filter):
-    def filter(self, record):
-        return "/GET /status HTTP/1.1" not in record.getMessage()
-
-# 2. Apply the filter to the Werkzeug logger
-# Werkzeug is the server library Flask uses locally
 log = logging.getLogger('werkzeug')
-log.addFilter(NoVideoFeedFilter())
+log.setLevel(logging.ERROR)
 
 # ==========================================
 # 0. GRID MAPPING
@@ -432,34 +425,20 @@ def mission_logic_thread():
     while True:
         time.sleep(0.1)
         
-        if angle != 0:
-            progress(f"TURN NEEDED: {angle} deg")
-            mission_state = STATE_TURNING
-            turn_dir = 1 if angle > 0 else -1
-            dur = perform_rotation(abs(angle), turn_dir)
-            time.sleep(dur)
-            navigator.current_heading = new_dir 
-            time.sleep(CONFIG["flight"]["post_turn_delay"])
-            
-            # CHANGED: Go to ALIGNING instead of PUSH_OUT
-            mission_state = STATE_ALIGNING
-            state_timer = time.time()
-        else:
-                progress("FORWARD (NO TURN)")
-                mission_state = STATE_PUSH_OUT # No turn needed, just go
-                state_timer = time.time()
-        
+        # --- STATE: INITIALIZATION ---
         if mission_state == STATE_INIT:
             conf_ok = (data and data.tracker_confidence >= CONFIG["t265"]["confidence_threshold"])
             if conf_ok or CONFIG["t265"]["ignore_quality"]: 
                 progress("READY: SET TARGET"); mission_state = STATE_WAIT_USER
 
+        # --- STATE: WAIT FOR USER START ---
         elif mission_state == STATE_WAIT_USER:
             web_data["curr"] = navigator.current_node if navigator.current_node else "?"
             web_data["target"] = navigator.target_node
             if mission_start_command: 
                 progress("STARTING..."); time.sleep(1); mission_state = STATE_TAKEOFF
 
+        # --- STATE: TAKEOFF ---
         elif mission_state == STATE_TAKEOFF:
             set_mode("GUIDED")
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
@@ -467,24 +446,26 @@ def mission_logic_thread():
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, CONFIG["flight"]["takeoff_alt"])
             while web_data["alt"] < (CONFIG["flight"]["takeoff_alt"] - 0.2): time.sleep(0.5)
             
-            # --- START SCANNING INSTEAD OF CALCULATING ---
-            progress("HOVER: SCANNING FOR START QR..."); 
+            progress("HOVER: SCANNING FOR START QR...")
             detected_qr_buffer = None
             mission_state = STATE_INITIAL_SCAN
 
+        # --- STATE: FIND START NODE ---
         elif mission_state == STATE_INITIAL_SCAN:
             if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
                 navigator.current_node = detected_qr_buffer
-                progress(f"LOCATED: {navigator.current_node}")
-                time.sleep(1.0) # Hover briefly to stabilize
+                # Force Heading Reset to NORTH on start to fix 180 bug
+                navigator.current_heading = DIR_N 
+                progress(f"LOCATED: {navigator.current_node} (RESET N)")
+                time.sleep(1.0)
                 mission_state = STATE_CALCULATING
             else:
-                # If taking too long, just wait.
                 pass
 
+        # --- STATE: CALCULATE PATH ---
         elif mission_state == STATE_CALCULATING:
             reset_pid()
-            detected_qr_buffer = None # Clear buffer
+            detected_qr_buffer = None 
 
             if navigator.current_node == navigator.target_node:
                 progress("TARGET REACHED. LANDING.")
@@ -501,6 +482,7 @@ def mission_logic_thread():
             next_coord = path_coords[1]
             angle, new_dir = navigator.get_turn_angle(next_coord)
             
+            # === CORRECTED LOGIC PLACEMENT ===
             if angle != 0:
                 progress(f"TURN NEEDED: {angle} deg")
                 mission_state = STATE_TURNING
@@ -509,58 +491,56 @@ def mission_logic_thread():
                 time.sleep(dur)
                 navigator.current_heading = new_dir 
                 time.sleep(CONFIG["flight"]["post_turn_delay"])
+                
+                # After turn, go to ALIGNING
+                mission_state = STATE_ALIGNING
+                state_timer = time.time()
             else:
                 progress("FORWARD (NO TURN)")
-            
-            progress("PUSH OUT")
-            state_timer = time.time()
-            mission_state = STATE_PUSH_OUT
+                mission_state = STATE_PUSH_OUT
+                state_timer = time.time()
+            # =================================
 
+        # --- STATE: ALIGN TO LINE (NEW) ---
         elif mission_state == STATE_ALIGNING:
-            # Timeout: If we can't align in 3 seconds, just go.
+            # 1. Timeout Check
             if time.time() - state_timer > 3.0:
                 progress("ALIGN TIMEOUT - PUSHING OUT")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
                 continue
             
+            # 2. Safety Check
             if not line_detected:
-                # If we don't see the line, we can't align. Just push out.
-                progress("NO LINE SEEN - PUSHING OUT")
+                progress("NO LINE - PUSHING OUT")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
                 continue
 
-            # Check Angle Error
-            # Threshold: 5 degrees. If error is small, we are good.
+            # 3. Angle Check (Threshold 5 degrees)
             if abs(line_angle_error) < 5.0:
                 progress("ALIGNED! PUSHING OUT")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
             else:
-                # We need to yaw slightly to fix the angle
+                # 4. Correction Yaw
                 progress(f"ALIGNING: Err {line_angle_error:.1f}")
-                # Simple P-Controller for Yaw
-                # If error is positive (Tilted Right), we need to Yaw Left (Negative)
                 yaw_cmd = -1 * (line_angle_error * 0.5) 
-                
-                # Send Yaw Command (Relative, small steps)
-                # Clamp speed to avoid oscillation
                 yaw_speed_cmd = min(abs(yaw_cmd), 20) 
                 yaw_dir_cmd = 1 if yaw_cmd > 0 else -1
                 
                 conn.mav.command_long_send(conn.target_system, conn.target_component,
                     mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
-                    1, # Angle (small step)
-                    yaw_speed_cmd, # Speed calculated by P-controller
-                    yaw_dir_cmd, 1, 0, 0, 0)
+                    1, yaw_speed_cmd, yaw_dir_cmd, 1, 0, 0, 0)
                 time.sleep(0.1)
 
+        # --- STATE: BLIND FORWARD ---
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
                 progress("FOLLOW LINE TO NEXT")
                 mission_state = STATE_FOLLOW_LINE
 
+        # --- STATE: FOLLOW LINE ---
         elif mission_state == STATE_FOLLOW_LINE:
             if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
                 if detected_qr_buffer != navigator.current_node:
@@ -569,14 +549,19 @@ def mission_logic_thread():
                     mission_state = STATE_AT_NODE
                     state_timer = time.time()
 
+        # --- STATE: AT NODE (PAUSE) ---
         elif mission_state == STATE_AT_NODE:
             if time.time() - state_timer > 2.0:
                 mission_state = STATE_CALCULATING
 
+        # --- STATE: LANDING ---
         elif mission_state == STATE_LANDING:
             set_mode("LAND"); time.sleep(1)
-            if not web_data["armed"]: mission_start_command = False; mission_state = STATE_WAIT_USER; progress("LANDED")
-
+            if not web_data["armed"]: 
+                mission_start_command = False
+                mission_state = STATE_WAIT_USER
+                progress("LANDED")
+                
 # ==========================================
 # 6. FLASK & API
 # ==========================================
