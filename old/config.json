@@ -23,7 +23,6 @@
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        "start_node": "Landing",
         "start_heading": "North"
     },
     "t265": {

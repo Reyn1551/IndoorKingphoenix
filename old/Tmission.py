@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 ###########################################################
-##   KING PHOENIX V40: GRID NAVIGATOR (2x3 GRAPH)        ##
-##   (Features: BFS Pathfinding + Dynamic Heading)       ##
+##   KING PHOENIX V41: AUTO-LOCATOR GRID NAV             ##
+##   (Features: Auto-Detect Start Node after Takeoff)    ##
 ###########################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -22,18 +22,11 @@ from pymavlink import mavutil
 from pyzbar.pyzbar import decode
 
 # ==========================================
-# 0. GRID MAPPING & PATHFINDING UTILS
+# 0. GRID MAPPING
 # ==========================================
-
-# DEFINISI GRID 2x3
-# (0,1) -- (1,1) -- (2,1)  (Row 1: QR_4, QR_5, QR_6)
+# (0,1) -- (1,1) -- (2,1)
 #   |        |        |
-# (0,0) -- (1,0) -- (2,0)  (Row 0: QR_1, QR_2, QR_3)
-
-#GRID_MAP = {
-#    "S,W,N,W,1": (0, 0), "ToNorth": (1, 0), "ToEast": (2, 0),
-#    "ToWest": (0, 1), "Landing": (1, 1), "ToSouth": (2, 1)
-#}
+# (0,0) -- (1,0) -- (2,0)
 
 GRID_MAP = {
     "S,W,N,W,1": (0, 1), "ToNorth": (1, 1), "ToEast": (2, 1),
@@ -46,9 +39,9 @@ DIR_NAMES = {DIR_N: "NORTH", DIR_E: "EAST", DIR_S: "SOUTH", DIR_W: "WEST"}
 
 class GridNavigator:
     def __init__(self):
-        self.current_node = "Landing" # Start position default
-        self.current_heading = DIR_N # Start facing North default
-        self.target_node = "S,W,N,W,1"    # Default Target
+        self.current_node = None     # Will be set by Auto-Scan
+        self.current_heading = DIR_N # Start facing North default (Configurable)
+        self.target_node = "S,W,N,W,1"
         self.path = []
 
     def set_target(self, target_qr):
@@ -59,7 +52,7 @@ class GridNavigator:
         return False
 
     def calculate_path(self):
-        # BFS Algorithm for Shortest Path on Grid
+        if not self.current_node: return [] # Unknown start
         start_pos = GRID_MAP.get(self.current_node)
         end_pos = GRID_MAP.get(self.target_node)
         
@@ -74,12 +67,10 @@ class GridNavigator:
             x, y = path[-1]
 
             if (x, y) == end_pos:
-                # Convert coordinates back to QR names for debugging
-                return path # List of coordinates [(0,0), (1,0), etc]
+                return path 
 
             for dx, dy in [DIR_N, DIR_E, DIR_S, DIR_W]:
                 next_x, next_y = x + dx, y + dy
-                # Check boundaries (2x3 Grid: x in 0-2, y in 0-1)
                 if 0 <= next_x <= 2 and 0 <= next_y <= 1:
                     if (next_x, next_y) not in visited:
                         visited.add((next_x, next_y))
@@ -92,13 +83,8 @@ class GridNavigator:
         curr_pos = GRID_MAP[self.current_node]
         req_dir = (next_pos[0] - curr_pos[0], next_pos[1] - curr_pos[1])
         
-        # Determine angle change needed
-        # Vectors: N(0,1), E(1,0), S(0,-1), W(-1,0)
+        if req_dir == self.current_heading: return 0, req_dir 
         
-        if req_dir == self.current_heading: return 0, req_dir # Straight
-        
-        # Calculate cross product to determine Left vs Right
-        # 2D cross product: dx1*dy2 - dy1*dx2
         cross = self.current_heading[0] * req_dir[1] - self.current_heading[1] * req_dir[0]
         dot = self.current_heading[0] * req_dir[0] + self.current_heading[1] * req_dir[1]
         
@@ -119,7 +105,7 @@ DEFAULT_CONFIG = {
         "yaw_speed": 30,            
         "pre_turn_delay": 2.0,      
         "post_turn_delay": 2.0,     
-        "blind_fwd_time": 2.5, # Time to push out of QR zone     
+        "blind_fwd_time": 2.5,  
         "alt_source": "T265"        
     },
     "control": {
@@ -146,7 +132,7 @@ DEFAULT_CONFIG = {
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        "start_node": "Landing",
+        # start_node REMOVED (Auto-detected now)
         "start_heading": "NORTH" # NORTH, EAST, SOUTH, WEST
     }
 }
@@ -165,9 +151,8 @@ def load_config():
                 print(f"LOADED CONFIG")
         except: pass
     
-    # Initialize Navigator based on Config
-    navigator.current_node = CONFIG["system"].get("start_node", "Landing")
-    h_str = CONFIG["system"].get("start_heading", "ToNorth")
+    # Initialize Heading Only (Position is now detected at runtime)
+    h_str = CONFIG["system"].get("start_heading", "NORTH")
     if h_str == "NORTH": navigator.current_heading = DIR_N
     elif h_str == "SOUTH": navigator.current_heading = DIR_S
     elif h_str == "WEST": navigator.current_heading = DIR_W
@@ -188,15 +173,15 @@ load_config()
 STATE_INIT = 0
 STATE_WAIT_USER = 1
 STATE_TAKEOFF = 2
+STATE_INITIAL_SCAN = 5   # <--- NEW STATE: Hover and look for start QR
 STATE_LANDING = 99
 STATE_SCANNING = 100
 
-# --- DYNAMIC GRID STATES ---
-STATE_FOLLOW_LINE = 10   # Moving between nodes
-STATE_AT_NODE = 20       # Detected QR, Braking
-STATE_CALCULATING = 30   # Deciding next move
-STATE_TURNING = 40       # Executing rotation
-STATE_PUSH_OUT = 50      # Blind forward to leave QR code area
+STATE_FOLLOW_LINE = 10
+STATE_AT_NODE = 20
+STATE_CALCULATING = 30
+STATE_TURNING = 40
+STATE_PUSH_OUT = 50
 
 mission_state = STATE_INIT
 mission_start_command = False
@@ -252,7 +237,7 @@ def heartbeat_cb(msg):
     web_data["armed"] = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
 
 def statustext_cb(msg): web_data["msg"] = msg.text.upper()
-def sys_status_cb(msg): pass # Battery logic omitted for brevity
+def sys_status_cb(msg): pass
 def global_pos_cb(msg): global fcu_altitude; fcu_altitude = msg.relative_alt / 1000.0
 
 def send_vision_msg():
@@ -272,11 +257,7 @@ def set_mode(mode):
     conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, conn.mode_mapping()[mode])
 
 def perform_rotation(angle, direction):
-    # direction: 1=Right(CW), -1=Left(CCW)
     mav_dir = 1 if direction == 1 else -1 
-    # MAVLink spec: 1=CW, -1=CCW. 
-    # Note: Logic below assumes angle is positive magnitude
-    
     yaw_spd = CONFIG["flight"].get("yaw_speed", 30)
     progress(f"CMD: YAW {angle} deg")
     for i in range(3):
@@ -361,8 +342,9 @@ def vision_thread_func():
                 cv2.putText(frame, qr_text, (obj.rect.left, obj.rect.top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
 
         # UI
+        curr_str = navigator.current_node if navigator.current_node else "SCANNING..."
         right_panel = np.zeros((h, 150, 3), dtype=np.uint8)
-        cv2.putText(right_panel, f"QR: {navigator.current_node}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
+        cv2.putText(right_panel, f"QR: {curr_str}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         cv2.putText(right_panel, f"TGT: {navigator.target_node}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         combined = cv2.hconcat([frame, right_panel])
         
@@ -379,12 +361,12 @@ def reset_pid():
 def send_vel_cmd():
     global mission_state, current_vx, current_vy, last_known_direction, state_timer
     
-    # BRAKE
-    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING]:
+    # BRAKE & HOLD
+    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
         return
 
-    # PUSH OUT (BLIND FORWARD to leave QR)
+    # PUSH OUT (BLIND FORWARD)
     if mission_state == STATE_PUSH_OUT:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, 0, 0,0,0, 0,0)
         return
@@ -415,7 +397,7 @@ def mission_logic_thread():
                 progress("READY: SET TARGET"); mission_state = STATE_WAIT_USER
 
         elif mission_state == STATE_WAIT_USER:
-            web_data["curr"] = navigator.current_node
+            web_data["curr"] = navigator.current_node if navigator.current_node else "?"
             web_data["target"] = navigator.target_node
             if mission_start_command: 
                 progress("STARTING..."); time.sleep(1); mission_state = STATE_TAKEOFF
@@ -427,11 +409,21 @@ def mission_logic_thread():
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, CONFIG["flight"]["takeoff_alt"])
             while web_data["alt"] < (CONFIG["flight"]["takeoff_alt"] - 0.2): time.sleep(0.5)
             
-            # Start logic
-            progress(f"TAKEOFF COMPLETE. AT {navigator.current_node}"); 
-            mission_state = STATE_CALCULATING
+            # --- START SCANNING INSTEAD OF CALCULATING ---
+            progress("HOVER: SCANNING FOR START QR..."); 
+            detected_qr_buffer = None
+            mission_state = STATE_INITIAL_SCAN
 
-        # --- CALCULATE NEXT MOVE ---
+        elif mission_state == STATE_INITIAL_SCAN:
+            if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
+                navigator.current_node = detected_qr_buffer
+                progress(f"LOCATED: {navigator.current_node}")
+                time.sleep(1.0) # Hover briefly to stabilize
+                mission_state = STATE_CALCULATING
+            else:
+                # If taking too long, just wait.
+                pass
+
         elif mission_state == STATE_CALCULATING:
             reset_pid()
             detected_qr_buffer = None # Clear buffer
@@ -441,18 +433,14 @@ def mission_logic_thread():
                 mission_state = STATE_LANDING
                 continue
 
-            # GET PATH
-            path_coords = navigator.calculate_path() # e.g., [(0,0), (0,1)]
+            path_coords = navigator.calculate_path()
             
             if len(path_coords) < 2:
                 progress("NO PATH / ALREADY THERE")
                 mission_state = STATE_LANDING
                 continue
             
-            # Identify Next Step (index 1 because index 0 is current)
             next_coord = path_coords[1]
-            
-            # Calculate Rotation
             angle, new_dir = navigator.get_turn_angle(next_coord)
             
             if angle != 0:
@@ -461,12 +449,11 @@ def mission_logic_thread():
                 turn_dir = 1 if angle > 0 else -1
                 dur = perform_rotation(abs(angle), turn_dir)
                 time.sleep(dur)
-                navigator.current_heading = new_dir # Update internal heading
+                navigator.current_heading = new_dir 
                 time.sleep(CONFIG["flight"]["post_turn_delay"])
             else:
                 progress("FORWARD (NO TURN)")
             
-            # Push out of current QR to avoid re-detecting it immediately
             progress("PUSH OUT")
             state_timer = time.time()
             mission_state = STATE_PUSH_OUT
@@ -477,9 +464,7 @@ def mission_logic_thread():
                 mission_state = STATE_FOLLOW_LINE
 
         elif mission_state == STATE_FOLLOW_LINE:
-            # Wait for NEW QR detection
             if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
-                # Ensure it's not the same QR we just left (basic debounce)
                 if detected_qr_buffer != navigator.current_node:
                     progress(f"ARRIVED AT {detected_qr_buffer}")
                     navigator.current_node = detected_qr_buffer
@@ -487,7 +472,6 @@ def mission_logic_thread():
                     state_timer = time.time()
 
         elif mission_state == STATE_AT_NODE:
-            # Pause briefly, then recalculate
             if time.time() - state_timer > 2.0:
                 mission_state = STATE_CALCULATING
 
@@ -529,12 +513,12 @@ def stop_cmd(): global mission_state; mission_state = STATE_LANDING; return json
 @app.route('/')
 def index():
     return render_template_string('''
-    <!DOCTYPE html><html><head><title>KING PHOENIX V40</title>
+    <!DOCTYPE html><html><head><title>KING PHOENIX V41</title>
     <style>body{background:#111;color:#0f0;font-family:monospace;padding:20px}
     .btn{padding:10px 20px;background:#333;color:#fff;border:1px solid #0f0;cursor:pointer;margin:5px}
     .grid-btn{width:80px;height:60px;margin:5px}
     </style></head><body>
-    <h1>KING PHOENIX V40: GRID NAV</h1>
+    <h1>KING PHOENIX V41: AUTO-START NAV</h1>
     <img src="/video_feed" style="border:2px solid #0f0;width:640px"><br>
     <h3>STATUS: <span id="st">INIT</span> | MSG: <span id="msg">-</span></h3>
     <h3>CURRENT: <span id="cur">-</span> | TARGET: <span id="tgt">-</span></h3>
@@ -582,7 +566,7 @@ default_conn = CONFIG["system"]["mavlink_connect"]
 parser.add_argument('--connect', default=default_conn)
 args = parser.parse_args()
 
-progress("BOOTING KING PHOENIX V40 (GRID NAV)...")
+progress("BOOTING KING PHOENIX V41 (AUTO-LOCATOR)...")
 conn = mavutil.mavlink_connection(args.connect, autoreconnect=True, source_system=1, source_component=191)
 callbacks = {'HEARTBEAT': heartbeat_cb, 'STATUSTEXT': statustext_cb, 'GLOBAL_POSITION_INT': global_pos_cb}
 threading.Thread(target=mavlink_loop, args=(conn, callbacks)).start()
