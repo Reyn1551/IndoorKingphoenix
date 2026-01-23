@@ -23,9 +23,8 @@
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        "qr_1": "LANDING",
-        "qr_2": "ToSouth",
-        "qr_3": "ToWest"
+        "start_node": "Landing",
+        "start_heading": "North"
     },
     "t265": {
         "confidence_threshold": 3,

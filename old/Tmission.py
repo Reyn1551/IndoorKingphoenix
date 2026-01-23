@@ -166,7 +166,7 @@ def load_config():
         except: pass
     
     # Initialize Navigator based on Config
-    navigator.current_node = CONFIG["system"].get("start_node", "LANDING")
+    navigator.current_node = CONFIG["system"].get("start_node", "Landing")
     h_str = CONFIG["system"].get("start_heading", "ToNorth")
     if h_str == "NORTH": navigator.current_heading = DIR_N
     elif h_str == "SOUTH": navigator.current_heading = DIR_S
