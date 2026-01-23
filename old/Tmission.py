@@ -124,15 +124,15 @@ DEFAULT_CONFIG = {
     },
     "vision": {
         "is_black_line": True,       
-        "threshold_val": 80,         
+        "threshold_val": 80,        
         "roi_height_ratio": 0.30,    
         "min_area": 1000,            
         "min_aspect_ratio": 0.8,     
-        "lost_timeout": 3.0,         
-        "camera_offset_x": 0         
+        "lost_timeout": 3.0,        
+        "camera_offset_x": 0        
     },
     "t265": {
-        "scale_factor": 1.0,         
+        "scale_factor": 1.0,        
         "confidence_threshold": 3,   
         "ignore_quality": False      
     },
@@ -188,6 +188,7 @@ STATE_FOLLOW_LINE = 10
 STATE_AT_NODE = 20
 STATE_CALCULATING = 30
 STATE_TURNING = 40
+STATE_PUSH_TO_LINE = 42
 STATE_ALIGNING = 45
 STATE_PUSH_OUT = 50
 
@@ -327,20 +328,13 @@ def vision_thread_func():
                 cv2.drawContours(roi, [best_cnt], -1, (0,255,255), 2)
                 cv2.line(frame, (cx_scr, real_cy), (cx, real_cy), (0,0,255), 2)
                 
-                # --- NEW: CALCULATE LINE ANGLE ---
-                # Fit a line to the contour
+                # --- CALCULATE LINE ANGLE ---
                 [vx, vy, x, y] = cv2.fitLine(best_cnt, cv2.DIST_L2, 0, 0.01, 0.01)
-                # Calculate angle in degrees (vertical is 90 or -90)
-                # We want deviation from vertical. 
-                # If vertical, vx ~ 0. If horizontal, vy ~ 0.
                 try:
                     angle_rad = m.atan2(vy, vx)
                     angle_deg = m.degrees(angle_rad)
-                    # Normalize to deviation from vertical (0 means perfectly straight up)
-                    # atan2 returns -180 to 180. Vertical is roughly 90 or -90.
                     if angle_deg < 0: angle_deg += 180
                     line_angle_error = angle_deg - 90 
-                    # Result: Positive = Tilted Right, Negative = Tilted Left
                 except:
                     line_angle_error = 0.0
                 # ---------------------------------
@@ -365,19 +359,37 @@ def vision_thread_func():
         for obj in qr_objects:
             qr_text = obj.data.decode("utf-8")
             if qr_text in GRID_MAP:
-                detected_qr_buffer = qr_text # Send to Mission Thread
+                detected_qr_buffer = qr_text
                 pts = np.array([obj.polygon], np.int32)
                 cv2.polylines(frame, [pts], True, (255,0,255), 2)
                 cv2.putText(frame, qr_text, (obj.rect.left, obj.rect.top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
 
-        # UI
+        # --- VISUALIZATION OVERLAY ---
+        # 1. Static Center Line (GREEN) - The Target
+        cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2)
+
+        # 2. Dynamic Angle Line (BLUE) - Current Tilt
+        if line_detected:
+            # Calculate tip of the vector based on error angle
+            # Error 0 = Up (Vertical).
+            # We map the angle to screen coordinates (where Y is down)
+            vis_len = 100
+            vis_rad = m.radians(line_angle_error) # deviation from vertical
+            
+            # sin(err) gives x-component, cos(err) gives y-component (relative to up)
+            tip_x = int(cx_scr + vis_len * m.sin(vis_rad))
+            tip_y = int((h/2) - vis_len * m.cos(vis_rad))
+            
+            cv2.line(frame, (cx_scr, int(h/2)), (tip_x, tip_y), (255, 0, 0), 2)
+
+        # UI Text
         curr_str = navigator.current_node if navigator.current_node else "SCANNING..."
         right_panel = np.zeros((h, 150, 3), dtype=np.uint8)
         cv2.putText(right_panel, f"QR: {curr_str}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         cv2.putText(right_panel, f"TGT: {navigator.target_node}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         combined = cv2.hconcat([frame, right_panel])
 
-        cv2.putText(frame, f"ANG: {line_angle_error:.1f}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+        cv2.putText(combined, f"ANG: {line_angle_error:.1f}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
         
         with frame_lock: global_frame = combined
         time.sleep(0.01)
@@ -401,7 +413,7 @@ def send_vel_cmd():
         return
 
     # PUSH OUT (BLIND FORWARD)
-    if mission_state == STATE_PUSH_OUT:
+    if mission_state in [STATE_PUSH_OUT, STATE_PUSH_TO_LINE]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, 0, 0,0,0, 0,0)
         return
 
@@ -501,6 +513,12 @@ def mission_logic_thread():
                 state_timer = time.time()
             # =================================
 
+        elif mission_state == STATE_PUSH_TO_LINE:
+            # Move forward for 1.5 seconds to clear QR and see black line
+            if time.time() - state_timer > 1.5:
+                mission_state = STATE_ALIGNING
+                state_timer = time.time()
+                
         # --- STATE: ALIGN TO LINE (NEW) ---
         elif mission_state == STATE_ALIGNING:
             # 1. Timeout Check
@@ -561,7 +579,7 @@ def mission_logic_thread():
                 mission_start_command = False
                 mission_state = STATE_WAIT_USER
                 progress("LANDED")
-                
+
 # ==========================================
 # 6. FLASK & API
 # ==========================================
