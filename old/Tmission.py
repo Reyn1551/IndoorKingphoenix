@@ -42,7 +42,7 @@ log.addFilter(NoVideoFeedFilter())
 
 GRID_MAP = {
     "S,W,N,W,1": (0, 1), "ToNorth": (1, 1), "ToEast": (2, 1),
-    "ToWest": (0, 0), "Landing": (1, 0), "ToSouth": (2, 0)
+    "ToWest": (0, 0), "N,S,W,S,3": (1, 0), "ToSouth": (2, 0)
 }
 
 # DIRECTION VECTORS
@@ -551,7 +551,7 @@ def index():
         <button class="btn grid-btn" onclick="st('ToNorth')">Tengah Atas</button>
         <button class="btn grid-btn" onclick="st('ToEast')">Kanan Atas</button><br>
         <button class="btn grid-btn" onclick="st('ToWest')">Kiri Bawah</button>
-        <button class="btn grid-btn" onclick="st('Landing')">Tengah Bawah</button>
+        <button class="btn grid-btn" onclick="st('N,S,W,S,3')">Tengah Bawah</button>
         <button class="btn grid-btn" onclick="st('ToSouth')">Kanan Bawah</button>
     </div>
 

@@ -23,7 +23,7 @@
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        "start_heading": "North"
+        "start_heading": "NORTH"
     },
     "t265": {
         "confidence_threshold": 3,
