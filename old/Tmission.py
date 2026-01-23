@@ -30,9 +30,14 @@ from pyzbar.pyzbar import decode
 #   |        |        |
 # (0,0) -- (1,0) -- (2,0)  (Row 0: QR_1, QR_2, QR_3)
 
+#GRID_MAP = {
+#    "S,W,N,W,1": (0, 0), "ToNorth": (1, 0), "ToEast": (2, 0),
+#    "ToWest": (0, 1), "Landing": (1, 1), "ToSouth": (2, 1)
+#}
+
 GRID_MAP = {
-    "S,W,N,W1": (0, 0), "ToNorth": (1, 0), "ToEast": (2, 0),
-    "ToWest": (0, 1), "Landing": (1, 1), "ToSouth": (2, 1)
+    "S,W,N,W,1": (0, 1), "ToNorth": (1, 1), "ToEast": (2, 1),
+    "ToWest": (0, 0), "Landing": (1, 0), "ToSouth": (2, 0)
 }
 
 # DIRECTION VECTORS
@@ -43,7 +48,7 @@ class GridNavigator:
     def __init__(self):
         self.current_node = "Landing" # Start position default
         self.current_heading = DIR_N # Start facing North default
-        self.target_node = "ToEast"    # Default Target
+        self.target_node = "S,W,N,W,1"    # Default Target
         self.path = []
 
     def set_target(self, target_qr):
@@ -161,8 +166,8 @@ def load_config():
         except: pass
     
     # Initialize Navigator based on Config
-    navigator.current_node = CONFIG["system"].get("start_node", "QR_1")
-    h_str = CONFIG["system"].get("start_heading", "EAST")
+    navigator.current_node = CONFIG["system"].get("start_node", "LANDING")
+    h_str = CONFIG["system"].get("start_heading", "ToNorth")
     if h_str == "NORTH": navigator.current_heading = DIR_N
     elif h_str == "SOUTH": navigator.current_heading = DIR_S
     elif h_str == "WEST": navigator.current_heading = DIR_W
@@ -541,12 +546,12 @@ def index():
     <br>
     <div>
         <b>SELECT TARGET:</b><br>
-        <button class="btn grid-btn" onclick="st('QR_4')">QR_4</button>
-        <button class="btn grid-btn" onclick="st('QR_5')">QR_5</button>
-        <button class="btn grid-btn" onclick="st('QR_6')">QR_6</button><br>
-        <button class="btn grid-btn" onclick="st('QR_1')">QR_1</button>
-        <button class="btn grid-btn" onclick="st('QR_2')">QR_2</button>
-        <button class="btn grid-btn" onclick="st('QR_3')">QR_3</button>
+        <button class="btn grid-btn" onclick="st('S,W,N,W,1')">Kiri Atas</button>
+        <button class="btn grid-btn" onclick="st('ToNorth')">Tengah Atas</button>
+        <button class="btn grid-btn" onclick="st('ToEast')">Kanan Atas</button><br>
+        <button class="btn grid-btn" onclick="st('ToWest')">Kiri Bawah</button>
+        <button class="btn grid-btn" onclick="st('Landing')">Tengah Bawah</button>
+        <button class="btn grid-btn" onclick="st('ToSouth')">Kanan Bawah</button>
     </div>
 
     <script>
