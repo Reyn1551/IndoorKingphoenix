@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 ###########################################################
-##   KING PHOENIX V20: ROBUST STARTUP & CONFIG GUARD     ##
-##   (Fix: AttributeError NoneType pada mavlink_connect) ##
+##   KING PHOENIX V25: INBOUND DIRECTION CONTROL         ##
+##   (Fix: Drone mundur saat Inbound? Atur arah disini)  ##
 ###########################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -26,17 +26,21 @@ from pyzbar.pyzbar import decode
 DEFAULT_CONFIG = {
     "flight": {
         "takeoff_alt": 1.0,         
-        "forward_speed": 0.1,       
+        "forward_speed": 0.1,       # Kecepatan Outbound (Berangkat)
+        "inbound_speed": 0.1,       # BARU: Kecepatan Inbound (Pulang)
+        "inbound_dir_scaler": 1.0,  # BARU: 1.0 = Maju, -1.0 = Mundur (Balik Arah)
         "max_lat_vel": 0.3,         
         "rotation_angle": 180,      
         "rotation_time": 5.0,       
+        "stabilize_time": 3.0,       
         "alt_source": "T265"        
     },
     "control": {
         "pid_kp": 0.008,    
         "pid_ki": 0.0001,   
         "pid_kd": 0.003,    
-        "search_vel": 0.08  
+        "search_vel": 0.08,         
+        "search_fwd_vel": 0.05      
     },
     "vision": {
         "is_black_line": True,       
@@ -61,9 +65,10 @@ DEFAULT_CONFIG = {
 }
 
 PARAM_DESCRIPTIONS = {
-    "rotation_time": "Waktu untuk menyelesaikan putaran 180 derajat.",
-    "qr_keyword": "Keyword QR Trigger.",
-    "forward_speed": "Kecepatan maju (m/s)."
+    "inbound_speed": "Kecepatan saat pulang (m/s).",
+    "inbound_dir_scaler": "Arah Pulang: 1.0 (Normal) atau -1.0 (Balik Arah jika drone mundur).",
+    "search_fwd_vel": "Kecepatan maju saat mencari garis (Inbound).",
+    "forward_speed": "Kecepatan saat berangkat (m/s)."
 }
 
 CONFIG_FILE = "config.json"
@@ -79,19 +84,17 @@ def load_config():
                 for section, content in saved_conf.items():
                     if section in CONFIG and isinstance(content, dict):
                         for key, val in content.items():
-                            if key in CONFIG[section]:
-                                # PROTEKSI ANTI-NULL: Jangan update jika nilainya None
-                                if val is not None:
-                                    CONFIG[section][key] = val
+                            if key in CONFIG[section] and val is not None:
+                                CONFIG[section][key] = val
             print(f"LOADED CONFIG FROM {CONFIG_FILE}")
         except Exception as e:
             print(f"CONFIG ERROR: {e}. USING DEFAULTS.")
             CONFIG = copy.deepcopy(DEFAULT_CONFIG)
+    if not CONFIG["system"]["mavlink_connect"]: CONFIG["system"]["mavlink_connect"] = "udpin:0.0.0.0:14550"
     
-    # SAFETY CHECK FINAL
-    if not CONFIG["system"]["mavlink_connect"]:
-        print("WARNING: mavlink_connect kosong. Menggunakan default.")
-        CONFIG["system"]["mavlink_connect"] = "udpin:0.0.0.0:14550"
+    # Ensure new keys exist
+    if "inbound_speed" not in CONFIG["flight"]: CONFIG["flight"]["inbound_speed"] = 0.1
+    if "inbound_dir_scaler" not in CONFIG["flight"]: CONFIG["flight"]["inbound_dir_scaler"] = 1.0
 
 def save_config_to_file():
     try:
@@ -186,37 +189,55 @@ def send_vision_msg():
 def set_mode(mode):
     conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, conn.mode_mapping()[mode])
 
+def perform_rotation():
+    progress("CMD: YAW 180")
+    conn.mav.command_long_send(conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
+        CONFIG["flight"]["rotation_angle"], 0, 1, 1, 0, 0, 0)
+
 # ==========================================
-# 4. VELOCITY & YAW LOGIC (FIXED)
+# 4. VELOCITY LOGIC (INBOUND PARAMETERS)
 # ==========================================
 current_vx = 0.0; current_vy = 0.0
+
+def reset_pid():
+    global prev_error, integral_error, current_vx, current_vy, last_known_direction
+    prev_error = 0.0
+    integral_error = 0.0
+    current_vx = 0.0
+    current_vy = 0.0
+    last_known_direction = 0 
+    progress("PID RESET (STABILIZING)")
 
 def send_vel_cmd():
     global mission_state, current_vx, current_vy, last_known_direction
     
+    if mission_state == STATE_ROTATING: return 
+
+    if mission_state == STATE_STABILIZE:
+        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
+        return
+
+    # LINE FOLLOWING
     if mission_state in [STATE_OUTBOUND, STATE_INBOUND] and line_detected:
-        # Ignore Yaw (Bit 10=1)
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, current_vx, current_vy, 0, 0,0,0, 0,0)
     
+    # SEARCHING
     elif mission_state in [STATE_OUTBOUND, STATE_INBOUND] and not line_detected:
-        search_spd = CONFIG["control"].get("search_vel", 0.08)
-        search_vy = search_spd if last_known_direction < 0 else -search_spd
-        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, search_vy, 0, 0,0,0, 0,0)
-
-    # ROTATION: Gunakan Yaw Rate di Velocity Command
-    elif mission_state == STATE_ROTATING:
-        target_deg = CONFIG["flight"]["rotation_angle"] 
-        duration = CONFIG["flight"]["rotation_time"]    
-        yaw_rate_rad = m.radians(target_deg) / duration
+        search_spd_lat = CONFIG["control"].get("search_vel", 0.08)
+        search_vy = search_spd_lat if last_known_direction < 0 else -search_spd_lat
+        if last_known_direction == 0: search_vy = -0.02 
         
-        # Mask: Enable Yaw Rate (Bit 10=0), Ignore Yaw Angle (Bit 9=1)
+        search_vx = 0.0
+        if mission_state == STATE_INBOUND:
+            search_vx = CONFIG["control"].get("search_fwd_vel", 0.05)
+        
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000101111000111, 
-            0,0,0, 0,0,0, 0,0,0, 0, yaw_rate_rad)
+            mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, search_vx, search_vy, 0, 0,0,0, 0,0)
 
-    elif mission_state in [STATE_SCANNING, STATE_WAIT_USER, STATE_HOVER_QR, STATE_STABILIZE]:
+    elif mission_state in [STATE_SCANNING, STATE_WAIT_USER, STATE_HOVER_QR]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
 
@@ -234,7 +255,7 @@ def mission_logic_thread():
                 qr_detect_counter += 1
                 req = CONFIG["vision"].get("qr_confirm_count", 2)
                 if qr_detect_counter >= req:
-                    progress(f"QR DETECTED! BRAKING..."); mission_state = STATE_HOVER_QR
+                    progress(f"QR DETECTED! STOPPING..."); mission_state = STATE_HOVER_QR
                     qr_detect_counter = 0; qr_data = "" 
         
         if mission_state == STATE_INIT:
@@ -258,14 +279,21 @@ def mission_logic_thread():
                 progress("LOST (OUTBOUND)"); mission_state = STATE_SCANNING
 
         elif mission_state == STATE_HOVER_QR:
-            time.sleep(2.0); progress("ROTATING..."); mission_state = STATE_ROTATING
+            time.sleep(2.0) 
+            progress("STARTING ROTATION..."); 
+            mission_state = STATE_ROTATING 
+            perform_rotation() 
             
         elif mission_state == STATE_ROTATING:
-            time.sleep(CONFIG["flight"]["rotation_time"]); progress("STABILIZING..."); mission_state = STATE_STABILIZE
+            time.sleep(CONFIG["flight"]["rotation_time"])
+            progress("ROTATION DONE. STABILIZING...")
+            reset_pid() 
+            mission_state = STATE_STABILIZE 
             
         elif mission_state == STATE_STABILIZE:
-            time.sleep(2.0); last_line_time = time.time(); qr_data = "" 
-            progress("INBOUND"); mission_state = STATE_INBOUND
+            time.sleep(CONFIG["flight"].get("stabilize_time", 3.0))
+            last_line_time = time.time(); qr_data = "" 
+            progress("INBOUND START"); mission_state = STATE_INBOUND
 
         elif mission_state == STATE_INBOUND:
             if not line_detected and (time.time() - last_line_time > CONFIG["vision"]["lost_timeout"]):
@@ -279,7 +307,7 @@ def mission_logic_thread():
             if line_detected: progress("RESUMING..."); mission_state = STATE_OUTBOUND
 
 # ==========================================
-# 5. VISION & PID
+# 5. VISION & PID (UPDATED FOR INBOUND)
 # ==========================================
 def gen_frames():
     global current_vx, current_vy, line_detected, last_line_time, qr_data, prev_error, integral_error, last_known_direction
@@ -327,7 +355,15 @@ def gen_frames():
                 integral_error += error_x; integral_error = max(min(integral_error, 500), -500) 
                 derivative = error_x - prev_error; raw_vy = (error_x * kp) + (integral_error * ki) + (derivative * kd)
                 prev_error = error_x; max_lat = CONFIG["flight"]["max_lat_vel"]
-                current_vy = max(min(raw_vy, max_lat), -max_lat); current_vx = CONFIG["flight"]["forward_speed"]
+                current_vy = max(min(raw_vy, max_lat), -max_lat)
+                
+                # === INBOUND SPEED & DIRECTION CONTROL ===
+                if mission_state == STATE_INBOUND:
+                    spd = CONFIG["flight"].get("inbound_speed", 0.1)
+                    scaler = CONFIG["flight"].get("inbound_dir_scaler", 1.0) # 1.0=Maju, -1.0=Mundur
+                    current_vx = spd * scaler
+                else:
+                    current_vx = CONFIG["flight"]["forward_speed"]
         else: integral_error = 0.0; prev_error = 0.0
 
         qr_objects = decode(frame)
@@ -368,7 +404,7 @@ def get_config_api(): return jsonify({"config": CONFIG, "desc": PARAM_DESCRIPTIO
 def save_config_api(): global CONFIG; CONFIG = request.json; save_config_to_file(); return jsonify({"status": "ok"})
 @app.route('/')
 def index():
-    return render_template_string('''<!DOCTYPE html><html><head><title>PHOENIX V20</title><meta name="viewport" content="width=device-width,initial-scale=1.0"><style>body{background:#121212;color:#eee;font-family:monospace;margin:0}.container{max-width:1200px;margin:0 auto;padding:20px}.tabs{display:flex;border-bottom:2px solid #333;margin-bottom:20px}.tab-btn{background:#1e1e1e;border:none;padding:15px 30px;color:#888;font-weight:bold;cursor:pointer;font-size:16px}.tab-btn.active{background:#333;color:#00d2ff;border-top:3px solid #00d2ff}.tab-content{display:none}.tab-content.active{display:block}.grid{display:grid;grid-template-columns:3fr 1fr;gap:20px}.video-box{border:2px solid #333;background:#000}.video-box img{width:100%}.panel{background:#1e1e1e;padding:15px;border-radius:8px;border:1px solid #333}.btn-start{width:100%;padding:15px;background:#009900;color:white;border:none;border-radius:5px;font-weight:bold;cursor:pointer}.btn-stop{width:100%;padding:15px;background:#cc0000;color:white;border:none;border-radius:5px;font-weight:bold;cursor:pointer;margin-top:10px}.console{height:120px;background:black;color:#0f0;padding:10px;overflow-y:auto;border:1px solid #333;font-size:11px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.section-box{background:#1e1e1e;padding:15px;border:1px solid #333}.section-title{color:#00d2ff;border-bottom:1px solid #333;margin-bottom:15px}.form-group{margin-bottom:10px}.form-group label{display:block;color:#aaa;font-size:12px}.form-group input{width:95%;background:#111;border:1px solid #444;color:white;padding:5px}.btn-save{width:100%;padding:15px;background:#007bff;color:white;border:none;margin-top:20px;cursor:pointer}</style></head><body><div class="container"><div class="tabs"><button class="tab-btn active" onclick="s('hud')">HUD</button><button class="tab-btn" onclick="s('set')">SETTINGS</button></div><div id="hud" class="tab-content active"><div class="grid"><div class="video-box"><img src="/video_feed"></div><div class="panel"><div style="text-align:center;font-size:18px;font-weight:bold;margin-bottom:10px" id="arm">DISARMED</div><button id="bs" class="btn-start" onclick="start()">START MISSION</button><button class="btn-stop" onclick="stop()">STOP / LAND</button><br><br><div>STATE: <span id="st" style="color:yellow">INIT</span></div><div>ALT: <span id="alt">0.0</span>m</div><div>BAT: <span id="bat">0.0</span>V</div><div>T265: <span id="t265">-</span></div><div class="console" id="log">System Ready.</div></div></div></div><div id="set" class="tab-content"><div id="sc" class="settings-grid"></div><button class="btn-save" onclick="save()">SAVE CONFIG</button></div></div><script>let cfg={};function s(t){document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(e=>e.classList.remove('active'));document.getElementById(t).classList.add('active');event.target.classList.add('active');if(t==='set')lc();}function start(){fetch('/start_mission').then(r=>r.json()).then(d=>{if(d.status==="ok"){document.getElementById('bs').innerText="RUNNING...";document.getElementById('bs').disabled=true;}else alert(d.msg);});}function stop(){if(confirm("LAND NOW?"))fetch('/stop_mission').then(r=>r.json()).then(d=>{alert(d.msg);document.getElementById('bs').innerText="STOPPED";});}setInterval(()=>{if(document.getElementById('hud').classList.contains('active'))fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('arm').innerText=d.armed?"ARMED":"DISARMED";document.getElementById('arm').style.color=d.armed?"red":"#555";document.getElementById('st').innerText=d.state;document.getElementById('alt').innerText=d.alt.toFixed(2);document.getElementById('bat').innerText=d.bat.toFixed(1);document.getElementById('t265').innerText=d.t265;let l=document.getElementById('log');if(l.lastChild.innerText!=="> "+d.msg){let n=document.createElement('div');n.innerText="> "+d.msg;l.appendChild(n);l.scrollTop=l.scrollHeight;}if(d.state.includes("WAIT")&&document.getElementById('bs').innerText!=="START MISSION"){document.getElementById('bs').disabled=false;document.getElementById('bs').innerText="START MISSION";}});},500);function lc(){fetch('/get_config').then(r=>r.json()).then(d=>{cfg=d.config;let c=document.getElementById('sc');c.innerHTML="";for(let s in cfg){let h=`<div class="section-box"><div class="section-title">${s.toUpperCase()}</div>`;for(let k in cfg[s]){let v=cfg[s][k];h+=`<div class="form-group"><label>${k}</label>`;if(typeof v==="boolean")h+=`<input type="checkbox" id="${s}-${k}" ${v?"checked":""}>`;else h+=`<input type="number" step="0.001" id="${s}-${k}" value="${v}">`;h+=`</div>`;}h+="</div>";c.innerHTML+=h;}});}function save(){for(let s in cfg)for(let k in cfg[s]){let e=document.getElementById(`${s}-${k}`);if(e.type==="checkbox")cfg[s][k]=e.checked;else cfg[s][k]=parseFloat(e.value);}fetch('/save_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(r=>r.json()).then(d=>{alert(d.status==="ok"?"SAVED":"FAIL");});}</script></body></html>''')
+    return render_template_string('''<!DOCTYPE html><html><head><title>PHOENIX V25</title><meta name="viewport" content="width=device-width,initial-scale=1.0"><style>body{background:#121212;color:#eee;font-family:monospace;margin:0}.container{max-width:1200px;margin:0 auto;padding:20px}.tabs{display:flex;border-bottom:2px solid #333;margin-bottom:20px}.tab-btn{background:#1e1e1e;border:none;padding:15px 30px;color:#888;font-weight:bold;cursor:pointer;font-size:16px}.tab-btn.active{background:#333;color:#00d2ff;border-top:3px solid #00d2ff}.tab-content{display:none}.tab-content.active{display:block}.grid{display:grid;grid-template-columns:3fr 1fr;gap:20px}.video-box{border:2px solid #333;background:#000}.video-box img{width:100%}.panel{background:#1e1e1e;padding:15px;border-radius:8px;border:1px solid #333}.btn-start{width:100%;padding:15px;background:#009900;color:white;border:none;border-radius:5px;font-weight:bold;cursor:pointer}.btn-stop{width:100%;padding:15px;background:#cc0000;color:white;border:none;border-radius:5px;font-weight:bold;cursor:pointer;margin-top:10px}.console{height:120px;background:black;color:#0f0;padding:10px;overflow-y:auto;border:1px solid #333;font-size:11px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.section-box{background:#1e1e1e;padding:15px;border:1px solid #333}.section-title{color:#00d2ff;border-bottom:1px solid #333;margin-bottom:15px}.form-group{margin-bottom:10px}.form-group label{display:block;color:#aaa;font-size:12px}.form-group input{width:95%;background:#111;border:1px solid #444;color:white;padding:5px}.btn-save{width:100%;padding:15px;background:#007bff;color:white;border:none;margin-top:20px;cursor:pointer}</style></head><body><div class="container"><div class="tabs"><button class="tab-btn active" onclick="s('hud')">HUD</button><button class="tab-btn" onclick="s('set')">SETTINGS</button></div><div id="hud" class="tab-content active"><div class="grid"><div class="video-box"><img src="/video_feed"></div><div class="panel"><div style="text-align:center;font-size:18px;font-weight:bold;margin-bottom:10px" id="arm">DISARMED</div><button id="bs" class="btn-start" onclick="start()">START MISSION</button><button class="btn-stop" onclick="stop()">STOP / LAND</button><br><br><div>STATE: <span id="st" style="color:yellow">INIT</span></div><div>ALT: <span id="alt">0.0</span>m</div><div>BAT: <span id="bat">0.0</span>V</div><div>T265: <span id="t265">-</span></div><div class="console" id="log">System Ready.</div></div></div></div><div id="set" class="tab-content"><div id="sc" class="settings-grid"></div><button class="btn-save" onclick="save()">SAVE CONFIG</button></div></div><script>let cfg={};function s(t){document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(e=>e.classList.remove('active'));document.getElementById(t).classList.add('active');event.target.classList.add('active');if(t==='set')lc();}function start(){fetch('/start_mission').then(r=>r.json()).then(d=>{if(d.status==="ok"){document.getElementById('bs').innerText="RUNNING...";document.getElementById('bs').disabled=true;}else alert(d.msg);});}function stop(){if(confirm("LAND NOW?"))fetch('/stop_mission').then(r=>r.json()).then(d=>{alert(d.msg);document.getElementById('bs').innerText="STOPPED";});}setInterval(()=>{if(document.getElementById('hud').classList.contains('active'))fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('arm').innerText=d.armed?"ARMED":"DISARMED";document.getElementById('arm').style.color=d.armed?"red":"#555";document.getElementById('st').innerText=d.state;document.getElementById('alt').innerText=d.alt.toFixed(2);document.getElementById('bat').innerText=d.bat.toFixed(1);document.getElementById('t265').innerText=d.t265;let l=document.getElementById('log');if(l.lastChild.innerText!=="> "+d.msg){let n=document.createElement('div');n.innerText="> "+d.msg;l.appendChild(n);l.scrollTop=l.scrollHeight;}if(d.state.includes("WAIT")&&document.getElementById('bs').innerText!=="START MISSION"){document.getElementById('bs').disabled=false;document.getElementById('bs').innerText="START MISSION";}});},500);function lc(){fetch('/get_config').then(r=>r.json()).then(d=>{cfg=d.config;let c=document.getElementById('sc');c.innerHTML="";for(let s in cfg){let h=`<div class="section-box"><div class="section-title">${s.toUpperCase()}</div>`;for(let k in cfg[s]){let v=cfg[s][k];h+=`<div class="form-group"><label>${k}</label>`;if(typeof v==="boolean")h+=`<input type="checkbox" id="${s}-${k}" ${v?"checked":""}>`;else h+=`<input type="number" step="0.001" id="${s}-${k}" value="${v}">`;h+=`</div>`;}h+="</div>";c.innerHTML+=h;}});}function save(){for(let s in cfg)for(let k in cfg[s]){let e=document.getElementById(`${s}-${k}`);if(e.type==="checkbox")cfg[s][k]=e.checked;else cfg[s][k]=parseFloat(e.value);}fetch('/save_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(r=>r.json()).then(d=>{alert(d.status==="ok"?"SAVED":"FAIL");});}</script></body></html>''')
 
 @app.route('/video_feed')
 def video_feed(): return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -378,12 +414,11 @@ def run_flask(): app.run(host='0.0.0.0', port=CONFIG["system"]["http_port"], thr
 # 7. MAIN STARTUP
 # ==========================================
 parser = argparse.ArgumentParser()
-# Fallback ke default string jika CONFIG masih None (double safety)
 default_conn = CONFIG["system"]["mavlink_connect"] or "udpin:0.0.0.0:14550"
 parser.add_argument('--connect', default=default_conn)
 args = parser.parse_args()
 
-progress("BOOTING PHOENIX V20...")
+progress("BOOTING PHOENIX V25...")
 conn = mavutil.mavlink_connection(args.connect, autoreconnect=True, source_system=1, source_component=191)
 callbacks = {'HEARTBEAT': heartbeat_cb, 'STATUSTEXT': statustext_cb, 'SYS_STATUS': sys_status_cb, 'GLOBAL_POSITION_INT': global_pos_cb}
 threading.Thread(target=mavlink_loop, args=(conn, callbacks)).start()
