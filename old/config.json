@@ -1,24 +1,31 @@
 {
     "control": {
-        "pid_kd": 0.0005,
-        "pid_ki": 5e-05,
-        "pid_kp": 5.5e-05,
+        "pid_kd": 0.0012,
+        "pid_ki": 1.5e-05,
+        "pid_kp": 1e-05,
         "search_fwd_vel": 0.05,
         "search_vel": 0.02
     },
     "flight": {
-        "alt_source": null,
-        "forward_speed": 0.18,
+        "alt_source": "T265",
+        "angle_turn": 80,
+        "angle_uturn": 170,
+        "blind_fwd_time": 2,
+        "forward_speed": 0.13,
+        "inbound_dir_scaler": 1,
+        "inbound_speed": 0.1,
         "max_lat_vel": 0.3,
-        "post_turn_delay": 2,
-        "pre_turn_delay": 2,
-        "takeoff_alt": 0.4
+        "post_turn_delay": 1,
+        "pre_turn_delay": 1,
+        "takeoff_alt": 0.4,
+        "yaw_speed": 40
     },
     "system": {
         "http_port": 5000,
-        "mavlink_connect": null,
-        "qr_code_1": null,
-        "qr_code_2": null
+        "mavlink_connect": "udpin:0.0.0.0:14550",
+        "qr_1": "LANDING",
+        "qr_2": "ToSouth",
+        "qr_3": "ToWest"
     },
     "t265": {
         "confidence_threshold": 3,
@@ -26,7 +33,7 @@
         "scale_factor": 1
     },
     "vision": {
-        "camera_offset_x": -50,
+        "camera_offset_x": -40,
         "is_black_line": true,
         "lost_timeout": 3,
         "min_area": 1000,
