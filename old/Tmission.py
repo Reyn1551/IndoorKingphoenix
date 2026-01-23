@@ -82,6 +82,8 @@ class GridNavigator:
     def get_turn_angle(self, next_pos):
         curr_pos = GRID_MAP[self.current_node]
         req_dir = (next_pos[0] - curr_pos[0], next_pos[1] - curr_pos[1])
+
+        print(f"DEBUG: CurrHead={self.current_heading} | ReqDir={req_dir}")
         
         if req_dir == self.current_heading: return 0, req_dir 
         
