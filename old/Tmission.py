@@ -26,7 +26,7 @@ import logging
 # 1. Create a filter class that ignores logs containing "/video_feed"
 class NoVideoFeedFilter(logging.Filter):
     def filter(self, record):
-        return "/video_feed" not in record.getMessage()
+        return "/GET /status HTTP/1.1" not in record.getMessage()
 
 # 2. Apply the filter to the Werkzeug logger
 # Werkzeug is the server library Flask uses locally
