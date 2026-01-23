@@ -407,12 +407,14 @@ def send_vel_cmd():
     # FOLLOW LINE + CONTINUOUS YAW CORRECTION
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
-            # === NEW: SIMULTANEOUS YAW CORRECTION ===
+            # === SIMULTANEOUS YAW CORRECTION WITH DEADBAND ===
             yaw_kp = CONFIG["control"].get("yaw_kp", 0.03)
             
-            # FIX: REMOVED THE "-1.0" MULTIPLIER
-            # Positive Error (Tilted Right) -> Positive Yaw (Turn Right) to align
-            yaw_rate = line_angle_error * yaw_kp
+            # DEADBAND: Ignore errors smaller than 5.0 degrees
+            if abs(line_angle_error) > 5.0:
+                yaw_rate = line_angle_error * yaw_kp
+            else:
+                yaw_rate = 0.0 # Fly straight if error is small
             
             # Limit Yaw Rate (Max ~30 deg/s)
             yaw_rate = max(min(yaw_rate, 0.5), -0.5)
@@ -435,7 +437,7 @@ def send_vel_cmd():
     # HOLD
     elif mission_state in [STATE_WAIT_USER]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
-        
+
 def mission_logic_thread():
     global mission_state, detected_qr_buffer, mission_start_command, state_timer
     
