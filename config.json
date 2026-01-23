@@ -33,6 +33,7 @@
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        "qr_keyword": "E,N,N,W,0"
+        "start_node": "Landing",
+        "start_heading": "NORTH"
     }
 }
