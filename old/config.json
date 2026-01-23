@@ -1,0 +1,38 @@
+{
+    "control": {
+        "pid_kd": 0.002,
+        "pid_ki": 0.0001,
+        "pid_kp": 0.001,
+        "search_vel": 0.02
+    },
+    "flight": {
+        "alt_source": "T265",
+        "forward_speed": 0.15,
+        "land_after_mission": true,
+        "max_lat_vel": 0.3,
+        "rotation_angle": 180,
+        "rotation_time": 6,
+        "takeoff_alt": 0.4
+    },
+    "system": {
+        "http_port": 5000,
+        "mavlink_connect": "udpin:0.0.0.0:14550",
+        "qr_keyword": "LANDING"
+    },
+    "t265": {
+        "confidence_threshold": 3,
+        "ignore_quality": true,
+        "scale_factor": 1
+    },
+    "vision": {
+        "camera_offset_x": -50,
+        "center_priority_weight": 15,
+        "is_black_line": true,
+        "lost_timeout": 3,
+        "min_area": 1000,
+        "min_aspect_ratio": 0.8,
+        "qr_confirm_count": 1,
+        "roi_height_ratio": 0.3,
+        "threshold_val": 60
+    }
+}
