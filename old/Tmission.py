@@ -2,7 +2,7 @@
 
 ###########################################################
 ##   KING PHOENIX V41: AUTO-LOCATOR GRID NAV             ##
-##   (Features: Auto-Detect Start Node after Takeoff)    ##
+##   (Features: Continuous Yaw Correction)               ##
 ###########################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -120,7 +120,8 @@ DEFAULT_CONFIG = {
         "pid_ki": 0.0001,   
         "pid_kd": 0.003,    
         "search_vel": 0.08,         
-        "search_fwd_vel": 0.05      
+        "search_fwd_vel": 0.05,
+        "yaw_kp": 0.03 # <--- NEW: Yaw Correction Gain
     },
     "vision": {
         "is_black_line": True,       
@@ -139,8 +140,7 @@ DEFAULT_CONFIG = {
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550",
-        # start_node REMOVED (Auto-detected now)
-        "start_heading": "NORTH" # NORTH, EAST, SOUTH, WEST
+        "start_heading": "NORTH"
     }
 }
 
@@ -158,7 +158,6 @@ def load_config():
                 print(f"LOADED CONFIG")
         except: pass
     
-    # Initialize Heading Only (Position is now detected at runtime)
     h_str = CONFIG["system"].get("start_heading", "NORTH")
     if h_str == "NORTH": navigator.current_heading = DIR_N
     elif h_str == "SOUTH": navigator.current_heading = DIR_S
@@ -180,7 +179,7 @@ load_config()
 STATE_INIT = 0
 STATE_WAIT_USER = 1
 STATE_TAKEOFF = 2
-STATE_INITIAL_SCAN = 5   # <--- NEW STATE: Hover and look for start QR
+STATE_INITIAL_SCAN = 5
 STATE_LANDING = 99
 STATE_SCANNING = 100
 
@@ -188,8 +187,6 @@ STATE_FOLLOW_LINE = 10
 STATE_AT_NODE = 20
 STATE_CALCULATING = 30
 STATE_TURNING = 40
-STATE_PUSH_TO_LINE = 42
-STATE_ALIGNING = 45
 STATE_PUSH_OUT = 50
 
 mission_state = STATE_INIT
@@ -365,30 +362,20 @@ def vision_thread_func():
                 cv2.putText(frame, qr_text, (obj.rect.left, obj.rect.top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
 
         # --- VISUALIZATION OVERLAY ---
-        # 1. Static Center Line (GREEN) - The Target
-        cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2)
+        cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2) # Center
 
-        # 2. Dynamic Angle Line (BLUE) - Current Tilt
         if line_detected:
-            # Calculate tip of the vector based on error angle
-            # Error 0 = Up (Vertical).
-            # We map the angle to screen coordinates (where Y is down)
             vis_len = 100
-            vis_rad = m.radians(line_angle_error) # deviation from vertical
-            
-            # sin(err) gives x-component, cos(err) gives y-component (relative to up)
+            vis_rad = m.radians(line_angle_error)
             tip_x = int(cx_scr + vis_len * m.sin(vis_rad))
             tip_y = int((h/2) - vis_len * m.cos(vis_rad))
-            
             cv2.line(frame, (cx_scr, int(h/2)), (tip_x, tip_y), (255, 0, 0), 2)
 
-        # UI Text
         curr_str = navigator.current_node if navigator.current_node else "SCANNING..."
         right_panel = np.zeros((h, 150, 3), dtype=np.uint8)
         cv2.putText(right_panel, f"QR: {curr_str}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         cv2.putText(right_panel, f"TGT: {navigator.target_node}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         combined = cv2.hconcat([frame, right_panel])
-
         cv2.putText(combined, f"ANG: {line_angle_error:.1f}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
         
         with frame_lock: global_frame = combined
@@ -408,21 +395,42 @@ def send_vel_cmd():
         return
     
     # BRAKE & HOLD
-    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGNING]:
+    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
         return
 
     # PUSH OUT (BLIND FORWARD)
-    if mission_state in [STATE_PUSH_OUT, STATE_PUSH_TO_LINE]:
+    if mission_state == STATE_PUSH_OUT:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, 0, 0,0,0, 0,0)
         return
 
-    # FOLLOW LINE
+    # FOLLOW LINE + CONTINUOUS YAW CORRECTION
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
-            conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, current_vx, current_vy, 0, 0,0,0, 0,0)
+            # === NEW: SIMULTANEOUS YAW CORRECTION ===
+            # Calculate Yaw Rate based on line angle error
+            # If line tilts RIGHT (Positive Error), we turn LEFT (Negative Yaw Rate)
+            yaw_kp = CONFIG["control"].get("yaw_kp", 0.03)
+            yaw_rate = -1.0 * line_angle_error * yaw_kp
+            
+            # Limit Yaw Rate (e.g. max 0.5 rad/s approx 30 deg/s)
+            yaw_rate = max(min(yaw_rate, 0.5), -0.5)
+
+            # BITMASK EXPLANATION:
+            # 0b0000111111000111 (Decimal 4039) -> Ignores Yaw and Yaw Rate
+            # 0b0000011111000111 (Decimal 1991) -> Ignores Yaw, BUT USES YAW RATE (Bit 11=0)
+            
+            mask = 0b011111000111 # 1991: Ignore Pos, Accel, Force, YawAngle. USE Vel+YawRate.
+
+            conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, 
+                mavutil.mavlink.MAV_FRAME_BODY_NED, 
+                mask, 
+                0,0,0, 
+                current_vx, current_vy, 0, # Velocity
+                0,0,0, 
+                0, yaw_rate) # Yaw Rate
         else:
-            # Simple Searching
+            # Simple Searching (No Yaw Correction)
             search_vx = CONFIG["control"]["search_fwd_vel"]
             search_vy = CONFIG["control"]["search_vel"] if last_known_direction < 0 else -CONFIG["control"]["search_vel"]
             conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, search_vx, search_vy, 0, 0,0,0, 0,0)
@@ -437,64 +445,49 @@ def mission_logic_thread():
     while True:
         time.sleep(0.1)
         
-        # --- STATE: INITIALIZATION ---
         if mission_state == STATE_INIT:
             conf_ok = (data and data.tracker_confidence >= CONFIG["t265"]["confidence_threshold"])
             if conf_ok or CONFIG["t265"]["ignore_quality"]: 
                 progress("READY: SET TARGET"); mission_state = STATE_WAIT_USER
 
-        # --- STATE: WAIT FOR USER START ---
         elif mission_state == STATE_WAIT_USER:
             web_data["curr"] = navigator.current_node if navigator.current_node else "?"
             web_data["target"] = navigator.target_node
             if mission_start_command: 
                 progress("STARTING..."); time.sleep(1); mission_state = STATE_TAKEOFF
 
-        # --- STATE: TAKEOFF ---
         elif mission_state == STATE_TAKEOFF:
             set_mode("GUIDED")
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
             while not web_data["armed"]: time.sleep(0.5)
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, CONFIG["flight"]["takeoff_alt"])
             while web_data["alt"] < (CONFIG["flight"]["takeoff_alt"] - 0.2): time.sleep(0.5)
-            
             progress("HOVER: SCANNING FOR START QR...")
             detected_qr_buffer = None
             mission_state = STATE_INITIAL_SCAN
 
-        # --- STATE: FIND START NODE ---
         elif mission_state == STATE_INITIAL_SCAN:
             if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
                 navigator.current_node = detected_qr_buffer
-                # Force Heading Reset to NORTH on start to fix 180 bug
                 navigator.current_heading = DIR_N 
                 progress(f"LOCATED: {navigator.current_node} (RESET N)")
                 time.sleep(1.0)
                 mission_state = STATE_CALCULATING
-            else:
-                pass
 
-        # --- STATE: CALCULATE PATH ---
         elif mission_state == STATE_CALCULATING:
             reset_pid()
             detected_qr_buffer = None 
 
             if navigator.current_node == navigator.target_node:
-                progress("TARGET REACHED. LANDING.")
-                mission_state = STATE_LANDING
-                continue
+                progress("TARGET REACHED. LANDING."); mission_state = STATE_LANDING; continue
 
             path_coords = navigator.calculate_path()
-            
             if len(path_coords) < 2:
-                progress("NO PATH / ALREADY THERE")
-                mission_state = STATE_LANDING
-                continue
+                progress("NO PATH / ALREADY THERE"); mission_state = STATE_LANDING; continue
             
             next_coord = path_coords[1]
             angle, new_dir = navigator.get_turn_angle(next_coord)
             
-            # === CORRECTED LOGIC PLACEMENT ===
             if angle != 0:
                 progress(f"TURN NEEDED: {angle} deg")
                 mission_state = STATE_TURNING
@@ -504,61 +497,20 @@ def mission_logic_thread():
                 navigator.current_heading = new_dir 
                 time.sleep(CONFIG["flight"]["post_turn_delay"])
                 
-                # After turn, go to ALIGNING
-                mission_state = STATE_ALIGNING
+                # Simplified: Just Push Out after Turn
+                progress("PUSH OUT (BLIND)")
+                mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
             else:
                 progress("FORWARD (NO TURN)")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
-            # =================================
 
-        elif mission_state == STATE_PUSH_TO_LINE:
-            # Move forward for 1.5 seconds to clear QR and see black line
-            if time.time() - state_timer > 1.5:
-                mission_state = STATE_ALIGNING
-                state_timer = time.time()
-                
-        # --- STATE: ALIGN TO LINE (NEW) ---
-        elif mission_state == STATE_ALIGNING:
-            # 1. Timeout Check
-            if time.time() - state_timer > 3.0:
-                progress("ALIGN TIMEOUT - PUSHING OUT")
-                mission_state = STATE_PUSH_OUT
-                state_timer = time.time()
-                continue
-            
-            # 2. Safety Check
-            if not line_detected:
-                progress("NO LINE - PUSHING OUT")
-                mission_state = STATE_PUSH_OUT
-                state_timer = time.time()
-                continue
-
-            # 3. Angle Check (Threshold 5 degrees)
-            if abs(line_angle_error) < 5.0:
-                progress("ALIGNED! PUSHING OUT")
-                mission_state = STATE_PUSH_OUT
-                state_timer = time.time()
-            else:
-                # 4. Correction Yaw
-                progress(f"ALIGNING: Err {line_angle_error:.1f}")
-                yaw_cmd = -1 * (line_angle_error * 0.5) 
-                yaw_speed_cmd = min(abs(yaw_cmd), 20) 
-                yaw_dir_cmd = 1 if yaw_cmd > 0 else -1
-                
-                conn.mav.command_long_send(conn.target_system, conn.target_component,
-                    mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
-                    1, yaw_speed_cmd, yaw_dir_cmd, 1, 0, 0, 0)
-                time.sleep(0.1)
-
-        # --- STATE: BLIND FORWARD ---
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
                 progress("FOLLOW LINE TO NEXT")
                 mission_state = STATE_FOLLOW_LINE
 
-        # --- STATE: FOLLOW LINE ---
         elif mission_state == STATE_FOLLOW_LINE:
             if detected_qr_buffer and detected_qr_buffer in GRID_MAP:
                 if detected_qr_buffer != navigator.current_node:
@@ -567,18 +519,13 @@ def mission_logic_thread():
                     mission_state = STATE_AT_NODE
                     state_timer = time.time()
 
-        # --- STATE: AT NODE (PAUSE) ---
         elif mission_state == STATE_AT_NODE:
             if time.time() - state_timer > 2.0:
                 mission_state = STATE_CALCULATING
 
-        # --- STATE: LANDING ---
         elif mission_state == STATE_LANDING:
             set_mode("LAND"); time.sleep(1)
-            if not web_data["armed"]: 
-                mission_start_command = False
-                mission_state = STATE_WAIT_USER
-                progress("LANDED")
+            if not web_data["armed"]: mission_start_command = False; mission_state = STATE_WAIT_USER; progress("LANDED")
 
 # ==========================================
 # 6. FLASK & API
