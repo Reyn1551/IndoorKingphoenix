@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 #####################################################
-##    KING PHOENIX V12: EMERGENCY STOP & RESTART   ##
+##    KING PHOENIX V15: REFINED STABILITY & BUFFER ##
+##    (Fix: Race Condition, Timeout Trap, Jitter)  ##
 #####################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -56,21 +57,19 @@ DEFAULT_CONFIG = {
     "system": {
         "http_port": 5000,
         "mavlink_connect": "udpin:0.0.0.0:14550", 
-        "qr_keyword": "E,N,N,W,0"      
+        "qr_keyword": "LANDING"      
     }
 }
 
 PARAM_DESCRIPTIONS = {
-    "pid_kp": "POWER: Besar koreksi. Naikkan jika drone malas kembali ke tengah.",
-    "pid_ki": "ANTI-DRIFT: Akumulasi error. Naikkan (0.0001) jika drone suka hanyut pelan.",
-    "pid_kd": "STABILIZER: Mencegah overshoot/goyang.",
-    "search_vel": "Kecepatan geser otomatis saat garis hilang.",
+    "rotation_time": "Waktu tunggu putaran. JANGAN TERLALU CEPAT.",
+    "qr_keyword": "Keyword QR untuk memicu Return.",
+    "pid_kp": "Sensitivitas Roll.",
+    "pid_ki": "Anti-Drift.",
     "takeoff_alt": "Target ketinggian (m).",
     "forward_speed": "Kecepatan maju (m/s).",
-    "max_lat_vel": "Batas maksimum kecepatan geser/roll.",
-    "roi_height_ratio": "Area pandang kamera (0.3 = 70% bawah).",
     "camera_offset_x": "Geser target tengah manual (Pixel).",
-    "center_priority_weight": "Prioritas garis tengah vs noise pinggir."
+    "qr_confirm_count": "Jumlah konfirmasi QR."
 }
 
 CONFIG_FILE = "config.json"
@@ -107,7 +106,12 @@ load_config()
 # 2. GLOBAL STATE
 # ==========================================
 STATE_INIT = 0; STATE_WAIT_USER = 1; STATE_TAKEOFF = 2; STATE_OUTBOUND = 3
-STATE_SCANNING = 4; STATE_ROTATING = 5; STATE_INBOUND = 6; STATE_LANDING = 7
+STATE_HOVER_QR = 4   # <-- BARU: Buffer Diam sebelum putar
+STATE_ROTATING = 5
+STATE_STABILIZE = 6  # <-- BARU: Buffer Diam setelah putar
+STATE_INBOUND = 7
+STATE_LANDING = 8
+STATE_SCANNING = 9   # Fallback state
 
 mission_state = STATE_INIT
 mission_start_command = False
@@ -115,6 +119,7 @@ line_detected = False
 last_line_time = time.time()
 qr_data = ""
 fcu_altitude = 0.0
+qr_detect_counter = 0
 
 # PID State
 prev_error = 0.0
@@ -202,47 +207,62 @@ current_vx = 0.0; current_vy = 0.0
 def send_vel_cmd():
     global mission_state, current_vx, current_vy, last_known_direction
     
+    # 1. TRACKING MODE (Maju + Geser)
     if mission_state in [STATE_OUTBOUND, STATE_INBOUND] and line_detected:
         vx = current_vx 
         vy = current_vy 
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, vx, vy, 0, 0,0,0, 0,0)
     
+    # 2. RECOVERY MODE (Garis Hilang)
     elif mission_state in [STATE_OUTBOUND, STATE_INBOUND] and not line_detected:
-        # RECOVERY
         search_spd = CONFIG["control"].get("search_vel", 0.08)
-        search_vy = search_spd if last_known_direction < 0 else -search_spd 
+        search_vy = search_spd if last_known_direction < 0 else -search_spd
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, search_vy, 0, 0,0,0, 0,0)
 
-    elif mission_state in [STATE_SCANNING, STATE_WAIT_USER]:
+    # 3. BRAKE / HOVER / STABILIZE MODE (Kirim Velocity 0 untuk mengunci posisi saat putar/diam)
+    elif mission_state in [STATE_SCANNING, STATE_WAIT_USER, STATE_HOVER_QR, STATE_ROTATING, STATE_STABILIZE]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
 
 def mission_logic_thread():
-    global mission_state, qr_data, last_line_time, mission_start_command
+    global mission_state, qr_data, last_line_time, mission_start_command, qr_detect_counter
     
     state_desc = [
-        "MENUNGGU T265", "MENUNGGU START", "TAKEOFF", 
-        "TRACKING (PERGI)", "SCAN QR (END)", "PUTAR BALIK", 
-        "TRACKING (PULANG)", "LANDING"
+        "INIT", "WAIT START", "TAKEOFF", "OUTBOUND (TRACK)", "HOVER (QR FOUND)", 
+        "ROTATING", "STABILIZING", "INBOUND (RETURN)", "LANDING", "SCANNING (LOST)"
     ]
     
     while True:
         time.sleep(0.1)
-        web_data["state"] = state_desc[mission_state]
+        # Update text state
+        if mission_state < len(state_desc): web_data["state"] = state_desc[mission_state]
+
+        # --- GLOBAL QR CHECK (PRIORITY INTERRUPT) ---
+        target_key = CONFIG["system"]["qr_keyword"]
+        # Hanya interrupt saat fase Tracking Outbound
+        if mission_state == STATE_OUTBOUND:
+            if target_key in qr_data:
+                qr_detect_counter += 1
+                req = CONFIG["vision"].get("qr_confirm_count", 1)
+                
+                if qr_detect_counter >= req:
+                    progress(f"QR MATCH! BRAKING FOR U-TURN...");
+                    # TRANSISI HALUS: Pindah ke HOVER_QR dulu (jangan langsung putar)
+                    mission_state = STATE_HOVER_QR
+        # ---------------------------------------------
 
         if mission_state == STATE_INIT:
             quality_ok = (data and data.tracker_confidence >= CONFIG["t265"]["confidence_threshold"])
-            ignore_quality = CONFIG["t265"].get("ignore_quality", False)
-            if quality_ok or (data and ignore_quality):
-                progress("T265 SIAP. MENUNGGU PILOT...")
+            ignore = CONFIG["t265"].get("ignore_quality", False)
+            if quality_ok or (data and ignore):
+                progress("T265 READY. WAITING...")
                 mission_state = STATE_WAIT_USER
 
         elif mission_state == STATE_WAIT_USER:
             if mission_start_command:
-                progress("MISI DIMULAI...")
-                time.sleep(2); mission_state = STATE_TAKEOFF
+                progress("STARTING..."); time.sleep(2); mission_state = STATE_TAKEOFF
 
         elif mission_state == STATE_TAKEOFF:
             set_mode("GUIDED")
@@ -250,36 +270,60 @@ def mission_logic_thread():
             while not web_data["armed"]: time.sleep(0.5)
             conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, CONFIG["flight"]["takeoff_alt"])
             while web_data["alt"] < (CONFIG["flight"]["takeoff_alt"] - 0.2): time.sleep(0.5)
-            progress("TAKEOFF OK. TRACKING..."); mission_state = STATE_OUTBOUND
+            progress("OUTBOUND STARTED"); mission_state = STATE_OUTBOUND
 
         elif mission_state == STATE_OUTBOUND:
+            # Jika garis hilang, masuk ke SCANNING (Diam dulu)
             if not line_detected and (time.time() - last_line_time > CONFIG["vision"]["lost_timeout"]):
-                progress("GARIS HABIS. SCAN QR..."); mission_state = STATE_SCANNING; qr_data = ""
+                progress("LINE LOST. HOLD POSITION..."); mission_state = STATE_SCANNING
 
-        elif mission_state == STATE_SCANNING:
-            if CONFIG["system"]["qr_keyword"] in qr_data:
-                progress(f"QR '{qr_data}' FOUND. U-TURN..."); mission_state = STATE_ROTATING
-                perform_rotation()
-                time.sleep(CONFIG["flight"]["rotation_time"])
-                last_line_time = time.time(); progress("PULANG..."); mission_state = STATE_INBOUND
+        # --- FASE PUTAR BALIK YANG DIPERBAIKI (STATE BUFFER) ---
+        
+        elif mission_state == STATE_HOVER_QR:
+            # Tahap 1: Diam dulu 2 detik agar momentum hilang
+            time.sleep(2.0)
+            progress("EXECUTING U-TURN...")
+            mission_state = STATE_ROTATING
+            # Kirim perintah putar SEKALI SAJA
+            perform_rotation()
+            
+        elif mission_state == STATE_ROTATING:
+            # Tahap 2: Tunggu putaran selesai (Timer)
+            time.sleep(CONFIG["flight"]["rotation_time"])
+            progress("STABILIZING POSE...")
+            mission_state = STATE_STABILIZE
+            
+        elif mission_state == STATE_STABILIZE:
+            # Tahap 3: Diam lagi 2 detik setelah putar (PENTING!)
+            # Ini memberi waktu kamera auto-exposure dan EKF settle
+            time.sleep(2.0)
+            
+            # CRITICAL FIX: RESET TIMER GARIS & QR
+            # Agar saat masuk INBOUND, drone tidak langsung panik "Line Lost"
+            last_line_time = time.time()
+            qr_data = "" # Bersihkan buffer QR agar tidak loop
+            qr_detect_counter = 0
+            progress("RETURNING HOME...")
+            mission_state = STATE_INBOUND
+            
+        # -----------------------------------------------------
 
         elif mission_state == STATE_INBOUND:
             if not line_detected and (time.time() - last_line_time > CONFIG["vision"]["lost_timeout"]):
-                progress("SAMPAI RUMAH. LANDING..."); mission_state = STATE_LANDING
+                progress("HOME REACHED. LANDING..."); mission_state = STATE_LANDING
 
         elif mission_state == STATE_LANDING:
-            # FORCE LAND (Entah dari normal atau emergency)
-            set_mode("LAND")
-            time.sleep(1)
-            
-            # Jika sudah Disarm, Reset Logic
+            set_mode("LAND"); time.sleep(1)
             if not web_data["armed"]:
-                mission_start_command = False
-                mission_state = STATE_WAIT_USER
-                progress("LANDING SELESAI. SIAP LAGI.")
+                mission_start_command = False; mission_state = STATE_WAIT_USER
+                progress("LANDED.")
+
+        elif mission_state == STATE_SCANNING:
+            # Fallback jika QR tidak ketemu saat jalan (bisa tambah fitur Auto Sweep disini nanti)
+            pass
 
 # ==========================================
-# 5. VISION & PID CONTROLLER
+# 5. VISION & PID
 # ==========================================
 def gen_frames():
     global current_vx, current_vy, line_detected, last_line_time, qr_data
@@ -294,7 +338,6 @@ def gen_frames():
         success, frame = cap.read()
         if not success: cap.release(); cap = find_working_camera(); continue
         h, w, _ = frame.shape
-        
         cut_y = int(h * CONFIG["vision"]["roi_height_ratio"])
         roi = frame[cut_y:h, 0:w]
         
@@ -319,9 +362,8 @@ def gen_frames():
             M = cv2.moments(cnt)
             if M['m00'] == 0: continue
             cx_cnt = int(M['m10'] / M['m00'])
-            dist_from_center = abs(cx_cnt - cx_scr)
-            score = area - (dist_from_center * penalty_weight)
-            
+            dist = abs(cx_cnt - cx_scr)
+            score = area - (dist * penalty_weight)
             if score > max_score: max_score = score; best_cnt = cnt
         
         line_detected = False
@@ -334,13 +376,9 @@ def gen_frames():
             if M['m00'] > 0:
                 cx = int(M['m10'] / M['m00'])
                 real_cy = cut_y + int(M['m01'] / M['m00'])
-                
-                # Visual Debug
-                cv2.line(frame, (cx_scr, 0), (cx_scr, h), (255,0,0), 2)
-                cv2.line(frame, (cx_scr, real_cy), (cx, real_cy), (0,0,255), 3) 
                 cv2.drawContours(roi, [best_cnt], -1, (0,255,255), 2)
+                cv2.line(frame, (cx_scr, real_cy), (cx, real_cy), (0,0,255), 2)
                 
-                # PID
                 error_x = cx - cx_scr
                 if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
                 
@@ -358,15 +396,20 @@ def gen_frames():
                 current_vy = max(min(raw_vy, max_lat), -max_lat)
                 current_vx = CONFIG["flight"]["forward_speed"]
         else:
-            integral_error = 0.0
-            prev_error = 0.0
+            integral_error = 0.0; prev_error = 0.0
 
+        # QR CHECK & RESET
+        found_qr = False
         qr_objects = decode(frame)
         for obj in qr_objects:
-            qr_text = obj.data.decode("utf-8"); qr_data = qr_text
+            qr_text = obj.data.decode("utf-8")
+            qr_data = qr_text # Update global var
+            found_qr = True
+            
             pts = np.array([obj.polygon], np.int32)
             cv2.polylines(frame, [pts], True, (255,0,255), 2)
             cv2.putText(frame, qr_text, (obj.rect.left, obj.rect.top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
+        if not found_qr: pass # Jangan reset disini agar persistence saat rotating
 
         thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
         right_panel = np.zeros_like(frame)
@@ -375,13 +418,11 @@ def gen_frames():
         cv2.line(right_panel, (cx_scr, 0), (cx_scr, h), (255, 0, 0), 2) 
 
         combined = cv2.hconcat([frame, right_panel])
-        
         cv2.rectangle(combined, (0, 0), (640, 60), (0,0,0), -1) 
         cv2.putText(combined, f"MISI: {web_data['state']}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
         cv2.putText(combined, f"ALT : {web_data['alt']:.2f}m", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
         col_pid = (0, 255, 0) if abs(error_x) < 20 else (0, 0, 255)
         cv2.putText(combined, f"ERR : {error_x} px", (200, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col_pid, 2)
-        cv2.putText(combined, f"OUT : {current_vy:.3f} m/s", (200, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
         
         action_txt = "CENTER"
         if current_vy > 0.02: action_txt = "<< GESER KIRI"
@@ -408,7 +449,6 @@ def start_cmd():
 @app.route('/stop_mission')
 def stop_cmd():
     global mission_state, mission_start_command
-    # Force state to LANDING
     mission_state = STATE_LANDING
     mission_start_command = False
     return jsonify({"status": "ok", "msg": "EMERGENCY LANDING TRIGGERED!"})
@@ -431,7 +471,7 @@ def index():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>KingPhoenix GCS</title>
+    <title>PHOENIX V15 REFINED</title>
     <style>
         body { background: #121212; color: #eee; font-family: monospace; margin: 0; padding: 0; }
         .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
@@ -527,7 +567,6 @@ def index():
                     let m=document.getElementById('msg-box');
                     if(m.lastChild.innerText!=="> "+d.msg){let n=document.createElement('div');n.innerText="> "+d.msg;m.appendChild(n);m.scrollTop=m.scrollHeight;}
                     
-                    // Logic tombol Start kembali aktif jika sudah Disarmed setelah STOP
                     if(d.state.includes("MENUNGGU") && document.getElementById('btn-start').innerText!=="START MISSION") {
                         document.getElementById('btn-start').disabled=false;
                         document.getElementById('btn-start').innerText="START MISSION";
@@ -590,7 +629,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--connect', default=CONFIG["system"]["mavlink_connect"])
 args = parser.parse_args()
 
-progress("BOOTING SYSTEM V12...")
+progress("BOOTING SYSTEM V15...")
 conn = mavutil.mavlink_connection(args.connect, autoreconnect=True, source_system=1, source_component=191)
 callbacks = {'HEARTBEAT': heartbeat_cb, 'STATUSTEXT': statustext_cb, 'SYS_STATUS': sys_status_cb, 'GLOBAL_POSITION_INT': global_pos_cb}
 threading.Thread(target=mavlink_loop, args=(conn, callbacks)).start()
