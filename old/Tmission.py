@@ -21,6 +21,18 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from pymavlink import mavutil
 from pyzbar.pyzbar import decode
 
+import logging
+
+# 1. Create a filter class that ignores logs containing "/video_feed"
+class NoVideoFeedFilter(logging.Filter):
+    def filter(self, record):
+        return "/video_feed" not in record.getMessage()
+
+# 2. Apply the filter to the Werkzeug logger
+# Werkzeug is the server library Flask uses locally
+log = logging.getLogger('werkzeug')
+log.addFilter(NoVideoFeedFilter())
+
 # ==========================================
 # 0. GRID MAPPING
 # ==========================================
