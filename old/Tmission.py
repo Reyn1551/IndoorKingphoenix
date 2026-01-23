@@ -195,6 +195,7 @@ STATE_FOLLOW_LINE = 10
 STATE_AT_NODE = 20
 STATE_CALCULATING = 30
 STATE_TURNING = 40
+STATE_ALIGNING = 45
 STATE_PUSH_OUT = 50
 
 mission_state = STATE_INIT
@@ -202,6 +203,7 @@ mission_start_command = False
 line_detected = False
 last_line_time = time.time()
 fcu_altitude = 0.0
+line_angle_error = 0.0
 
 prev_error = 0.0; integral_error = 0.0; last_known_direction = 0 
 state_timer = 0.0
@@ -288,7 +290,7 @@ current_vx = 0.0; current_vy = 0.0
 detected_qr_buffer = None
 
 def vision_thread_func():
-    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer
+    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error
     
     cap = find_working_camera()
     while not cap: time.sleep(1); cap = find_working_camera()
@@ -331,6 +333,25 @@ def vision_thread_func():
                 cx = int(M['m10'] / M['m00']); real_cy = cut_y + int(M['m01'] / M['m00'])
                 cv2.drawContours(roi, [best_cnt], -1, (0,255,255), 2)
                 cv2.line(frame, (cx_scr, real_cy), (cx, real_cy), (0,0,255), 2)
+                
+                # --- NEW: CALCULATE LINE ANGLE ---
+                # Fit a line to the contour
+                [vx, vy, x, y] = cv2.fitLine(best_cnt, cv2.DIST_L2, 0, 0.01, 0.01)
+                # Calculate angle in degrees (vertical is 90 or -90)
+                # We want deviation from vertical. 
+                # If vertical, vx ~ 0. If horizontal, vy ~ 0.
+                try:
+                    angle_rad = m.atan2(vy, vx)
+                    angle_deg = m.degrees(angle_rad)
+                    # Normalize to deviation from vertical (0 means perfectly straight up)
+                    # atan2 returns -180 to 180. Vertical is roughly 90 or -90.
+                    if angle_deg < 0: angle_deg += 180
+                    line_angle_error = angle_deg - 90 
+                    # Result: Positive = Tilted Right, Negative = Tilted Left
+                except:
+                    line_angle_error = 0.0
+                # ---------------------------------
+
                 error_x = cx - cx_scr
                 if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
                 kp = CONFIG["control"]["pid_kp"]; ki = CONFIG["control"]["pid_ki"]; kd = CONFIG["control"]["pid_kd"]
@@ -342,7 +363,8 @@ def vision_thread_func():
                 current_vx = CONFIG["flight"]["forward_speed"]
         else:
             temp_line_detected = False; integral_error = 0.0; prev_error = 0.0; current_vx = 0.0; current_vy = 0.0
-        
+            line_angle_error = 0.0
+                
         line_detected = temp_line_detected
 
         # --- QR DETECTION ---
@@ -361,6 +383,8 @@ def vision_thread_func():
         cv2.putText(right_panel, f"QR: {curr_str}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         cv2.putText(right_panel, f"TGT: {navigator.target_node}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
         combined = cv2.hconcat([frame, right_panel])
+
+        cv2.putText(frame, f"ANG: {line_angle_error:.1f}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
         
         with frame_lock: global_frame = combined
         time.sleep(0.01)
@@ -379,7 +403,7 @@ def send_vel_cmd():
         return
     
     # BRAKE & HOLD
-    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN]:
+    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGNING]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
         return
 
@@ -407,6 +431,23 @@ def mission_logic_thread():
     
     while True:
         time.sleep(0.1)
+        
+        if angle != 0:
+            progress(f"TURN NEEDED: {angle} deg")
+            mission_state = STATE_TURNING
+            turn_dir = 1 if angle > 0 else -1
+            dur = perform_rotation(abs(angle), turn_dir)
+            time.sleep(dur)
+            navigator.current_heading = new_dir 
+            time.sleep(CONFIG["flight"]["post_turn_delay"])
+            
+            # CHANGED: Go to ALIGNING instead of PUSH_OUT
+            mission_state = STATE_ALIGNING
+            state_timer = time.time()
+        else:
+                progress("FORWARD (NO TURN)")
+                mission_state = STATE_PUSH_OUT # No turn needed, just go
+                state_timer = time.time()
         
         if mission_state == STATE_INIT:
             conf_ok = (data and data.tracker_confidence >= CONFIG["t265"]["confidence_threshold"])
@@ -474,7 +515,47 @@ def mission_logic_thread():
             progress("PUSH OUT")
             state_timer = time.time()
             mission_state = STATE_PUSH_OUT
+
+        elif mission_state == STATE_ALIGNING:
+            # Timeout: If we can't align in 3 seconds, just go.
+            if time.time() - state_timer > 3.0:
+                progress("ALIGN TIMEOUT - PUSHING OUT")
+                mission_state = STATE_PUSH_OUT
+                state_timer = time.time()
+                continue
             
+            if not line_detected:
+                # If we don't see the line, we can't align. Just push out.
+                progress("NO LINE SEEN - PUSHING OUT")
+                mission_state = STATE_PUSH_OUT
+                state_timer = time.time()
+                continue
+
+            # Check Angle Error
+            # Threshold: 5 degrees. If error is small, we are good.
+            if abs(line_angle_error) < 5.0:
+                progress("ALIGNED! PUSHING OUT")
+                mission_state = STATE_PUSH_OUT
+                state_timer = time.time()
+            else:
+                # We need to yaw slightly to fix the angle
+                progress(f"ALIGNING: Err {line_angle_error:.1f}")
+                # Simple P-Controller for Yaw
+                # If error is positive (Tilted Right), we need to Yaw Left (Negative)
+                yaw_cmd = -1 * (line_angle_error * 0.5) 
+                
+                # Send Yaw Command (Relative, small steps)
+                # Clamp speed to avoid oscillation
+                yaw_speed_cmd = min(abs(yaw_cmd), 20) 
+                yaw_dir_cmd = 1 if yaw_cmd > 0 else -1
+                
+                conn.mav.command_long_send(conn.target_system, conn.target_component,
+                    mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
+                    1, # Angle (small step)
+                    yaw_speed_cmd, # Speed calculated by P-controller
+                    yaw_dir_cmd, 1, 0, 0, 0)
+                time.sleep(0.1)
+
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
                 progress("FOLLOW LINE TO NEXT")
