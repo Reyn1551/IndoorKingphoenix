@@ -361,6 +361,9 @@ def reset_pid():
 def send_vel_cmd():
     global mission_state, current_vx, current_vy, last_known_direction, state_timer
     
+    if mission_state == STATE_TURNING:
+        return
+    
     # BRAKE & HOLD
     if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)

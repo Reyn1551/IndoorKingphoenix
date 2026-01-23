@@ -11,7 +11,7 @@
         "angle_turn": 80,
         "angle_uturn": 170,
         "blind_fwd_time": 2,
-        "forward_speed": 0.13,
+        "forward_speed": 0.1,
         "inbound_dir_scaler": 1,
         "inbound_speed": 0.1,
         "max_lat_vel": 0.3,
