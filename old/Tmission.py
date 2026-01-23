@@ -408,29 +408,26 @@ def send_vel_cmd():
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
             # === NEW: SIMULTANEOUS YAW CORRECTION ===
-            # Calculate Yaw Rate based on line angle error
-            # If line tilts RIGHT (Positive Error), we turn LEFT (Negative Yaw Rate)
             yaw_kp = CONFIG["control"].get("yaw_kp", 0.03)
-            yaw_rate = -1.0 * line_angle_error * yaw_kp
             
-            # Limit Yaw Rate (e.g. max 0.5 rad/s approx 30 deg/s)
+            # FIX: REMOVED THE "-1.0" MULTIPLIER
+            # Positive Error (Tilted Right) -> Positive Yaw (Turn Right) to align
+            yaw_rate = line_angle_error * yaw_kp
+            
+            # Limit Yaw Rate (Max ~30 deg/s)
             yaw_rate = max(min(yaw_rate, 0.5), -0.5)
 
-            # BITMASK EXPLANATION:
-            # 0b0000111111000111 (Decimal 4039) -> Ignores Yaw and Yaw Rate
-            # 0b0000011111000111 (Decimal 1991) -> Ignores Yaw, BUT USES YAW RATE (Bit 11=0)
-            
-            mask = 0b011111000111 # 1991: Ignore Pos, Accel, Force, YawAngle. USE Vel+YawRate.
+            mask = 0b011111000111 # Ignore Pos+Yaw. Use Vel+YawRate.
 
             conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, 
                 mavutil.mavlink.MAV_FRAME_BODY_NED, 
                 mask, 
                 0,0,0, 
-                current_vx, current_vy, 0, # Velocity
+                current_vx, current_vy, 0, 
                 0,0,0, 
-                0, yaw_rate) # Yaw Rate
+                0, yaw_rate)
         else:
-            # Simple Searching (No Yaw Correction)
+            # Simple Searching
             search_vx = CONFIG["control"]["search_fwd_vel"]
             search_vy = CONFIG["control"]["search_vel"] if last_known_direction < 0 else -CONFIG["control"]["search_vel"]
             conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, search_vx, search_vy, 0, 0,0,0, 0,0)
@@ -438,7 +435,7 @@ def send_vel_cmd():
     # HOLD
     elif mission_state in [STATE_WAIT_USER]:
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
-
+        
 def mission_logic_thread():
     global mission_state, detected_qr_buffer, mission_start_command, state_timer
     
