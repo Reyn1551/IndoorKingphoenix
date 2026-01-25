@@ -188,6 +188,7 @@ STATE_AT_NODE = 20
 STATE_CALCULATING = 30
 STATE_TURNING = 40
 STATE_PUSH_OUT = 50
+STATE_ALIGN_NORTH = 60
 
 mission_state = STATE_INIT
 mission_start_command = False
@@ -478,7 +479,10 @@ def mission_logic_thread():
             detected_qr_buffer = None 
 
             if navigator.current_node == navigator.target_node:
-                progress("TARGET REACHED. LANDING."); mission_state = STATE_LANDING; continue
+                # UPDATED: Go to ALIGN_NORTH instead of LANDING
+                progress("TARGET REACHED. ALIGNING NORTH..."); 
+                mission_state = STATE_ALIGN_NORTH; 
+                continue
 
             path_coords = navigator.calculate_path()
             if len(path_coords) < 2:
@@ -504,6 +508,37 @@ def mission_logic_thread():
                 progress("FORWARD (NO TURN)")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
+            
+        elif mission_state == STATE_ALIGN_NORTH:
+            current = navigator.current_heading
+            
+            # Logic to determine turn needed to face NORTH (DIR_N)
+            req_angle = 0
+            turn_dir = 1 # 1 for CW, -1 for CCW
+
+            if current == DIR_N:
+                progress("ALREADY FACING NORTH")
+                req_angle = 0
+            elif current == DIR_E:
+                # Facing East, turn Left 90 to face North
+                progress("FACING EAST -> TURNING LEFT TO NORTH")
+                req_angle = 90; turn_dir = -1
+            elif current == DIR_S:
+                # Facing South, turn 180 to face North
+                progress("FACING SOUTH -> TURNING 180 TO NORTH")
+                req_angle = 180; turn_dir = 1
+            elif current == DIR_W:
+                # Facing West, turn Right 90 to face North
+                progress("FACING WEST -> TURNING RIGHT TO NORTH")
+                req_angle = 90; turn_dir = 1
+            
+            if req_angle > 0:
+                dur = perform_rotation(req_angle, turn_dir)
+                time.sleep(dur)
+                navigator.current_heading = DIR_N # Force update state
+                time.sleep(1.0) # Stabilization delay
+
+            mission_state = STATE_LANDING
 
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
