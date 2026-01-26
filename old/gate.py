@@ -227,20 +227,6 @@ def progress(s):
 # ==========================================
 # 3. HARDWARE & MAVLINK
 # ==========================================
-def find_working_camera():
-    global active_cam_index
-    if active_cam_index is not None:
-        cap = cv2.VideoCapture(active_cam_index)
-        if cap.isOpened(): return cap
-    for index in range(10):
-        cap = cv2.VideoCapture(index)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.size > 0:
-                active_cam_index = index
-                return cap
-            else: cap.release()
-    return None
 
 def front_camera_thread():
     global gate_altitude_request, last_red_seen_time
@@ -375,15 +361,24 @@ detected_qr_buffer = None
 def vision_thread_func():
     global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error
     
-    cap = find_working_camera()
-    while not cap: time.sleep(1); cap = find_working_camera()
+    BOTTOM_CAM_INDEX = 0 
+    
+    print(f"VISION THREAD: Opening Bottom Camera (Index {BOTTOM_CAM_INDEX})...")
+    cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
     cap.set(3, 320); cap.set(4, 240)
-    print("VISION THREAD STARTED")
+    print("VISION THREAD STARTED (Bottom Cam OK)")
 
     while True:
         success, frame = cap.read()
         if not success: 
-            cap.release(); time.sleep(0.5); cap = find_working_camera(); continue
+            # If the camera disconnects during flight, try to reconnect to the SAME index
+            print("VISION WARNING: Frame lost. Reconnecting...")
+            cap.release()
+            time.sleep(0.5)
+            cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
+            cap.set(3, 320)
+            cap.set(4, 240)
+            continue
         
         h, w, _ = frame.shape
         cut_y = int(h * CONFIG["vision"]["roi_height_ratio"])
@@ -782,6 +777,7 @@ sched.add_job(send_vel_cmd, 'interval', seconds=1/10.0)
 sched.start()
 
 threading.Thread(target=vision_thread_func, daemon=True).start()
+threading.Thread(target=front_camera_thread, daemon=True).start()
 threading.Thread(target=mission_logic_thread, daemon=True).start()
 
 progress("SYSTEM READY. CALIBRATE T265...")
