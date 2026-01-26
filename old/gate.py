@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
 ###########################################################
-##   KING PHOENIX V41: AUTO-LOCATOR GRID NAV             ##
-##   (Features: Continuous Yaw Correction)               ##
+##                    KING PHOENIX FIRA 2026             ##
 ###########################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -45,7 +44,7 @@ DIR_NAMES = {DIR_N: "NORTH", DIR_E: "EAST", DIR_S: "SOUTH", DIR_W: "WEST"}
 class GridNavigator:
     def __init__(self):
         self.current_node = None     # Will be set by Auto-Scan
-        self.current_heading = DIR_N # Start facing North default (Configurable)
+        self.current_heading = DIR_N # Start facing North default
         self.target_node = "S,W,N,W,1"
         self.path = []
 
@@ -57,7 +56,7 @@ class GridNavigator:
         return False
 
     def calculate_path(self):
-        if not self.current_node: return [] # Unknown start
+        if not self.current_node: return [] 
         start_pos = GRID_MAP.get(self.current_node)
         end_pos = GRID_MAP.get(self.target_node)
         
@@ -212,7 +211,10 @@ prev_error = 0.0; integral_error = 0.0; last_known_direction = 0
 state_timer = 0.0
 web_data = {"mode": "INIT", "armed": False, "alt": 0.0, "msg": "Booting...", "target": "NONE", "curr": "?"}
 
-global_frame = None; frame_lock = threading.Lock()
+# TWO GLOBAL FRAMES NOW
+global_frame = None; frame_lock = threading.Lock() # Bottom Camera
+global_front_frame = None; front_frame_lock = threading.Lock() # Front Camera
+
 pipe, data, prev_data, H_aeroRef_aeroBody = None, None, None, None
 reset_counter = 1; current_time_us = 0
 mavlink_thread_should_exit = False
@@ -229,13 +231,16 @@ def progress(s):
 # ==========================================
 
 def front_camera_thread():
-    global gate_altitude_request, last_red_seen_time
+    global gate_altitude_request, last_red_seen_time, global_front_frame
     
-    # 1. Initialize Front Camera (usually index 1 if Down is 0)
-    # You might need to swap 0 and 1 depending on which plugged in first
-    cap_front = cv2.VideoCapture(2) # Assume T265 is distinct, Down is 0, Front is 2? Check ls /dev/video*
+    # 1. Initialize Front Camera 
+    FRONT_CAM_INDEX = 8 # Check if this is correct using the checker script!
+    cap_front = cv2.VideoCapture(FRONT_CAM_INDEX) 
+    
+    # Fallback logic if 2 is missing, try 1 (dangerous if plugged in wrong)
     if not cap_front.isOpened():
-        cap_front = cv2.VideoCapture(1) # Fallback
+        print(f"FRONT CAM: Index {FRONT_CAM_INDEX} failed, trying 1...")
+        cap_front = cv2.VideoCapture(1)
         
     cap_front.set(3, 320)
     cap_front.set(4, 240)
@@ -250,7 +255,7 @@ def front_camera_thread():
         # 2. Convert to HSV
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # 3. Detect Red (Ranges wrap around 180)
+        # 3. Detect Red 
         lower_r1 = np.array(CONFIG["vision"]["gates"]["red_lower1"])
         upper_r1 = np.array(CONFIG["vision"]["gates"]["red_upper1"])
         lower_r2 = np.array(CONFIG["vision"]["gates"]["red_lower2"])
@@ -269,44 +274,48 @@ def front_camera_thread():
         cnt_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         cnt_yel, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Logic: Find largest valid area
         found_red = False
         if cnt_red:
             max_r = max(cnt_red, key=cv2.contourArea)
             if cv2.contourArea(max_r) > CONFIG["vision"]["gates"]["min_gate_area"]:
                 found_red = True
+                # VISUALIZATION: Draw Red Contour
+                cv2.drawContours(frame, [max_r], -1, (0, 0, 255), 3)
+                cv2.putText(frame, "RED GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
                 
         found_yellow = False
         if cnt_yel:
             max_y = max(cnt_yel, key=cv2.contourArea)
             if cv2.contourArea(max_y) > CONFIG["vision"]["gates"]["min_gate_area"]:
                 found_yellow = True
+                # VISUALIZATION: Draw Yellow Contour
+                cv2.drawContours(frame, [max_y], -1, (0, 255, 255), 3)
+                cv2.putText(frame, "YELLOW GATE", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
         
         current_time = time.time()
-        # 6. Decision Logic (Red takes priority for safety)
+        
+        # 6. Decision Logic 
         if found_red:
-            # GATE DETECTED: RED -> CLIMB
             gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
-            last_red_seen_time = current_time # Update timestamp constantly while seeing it
+            last_red_seen_time = current_time 
             print("GATE: RED (CLIMBING)")
             
         elif found_yellow:
-            # We see Yellow -> Go Low
-            gate_altitude_request = CONFIG["vision"]["gates"]["gate_hold_alt"] # 0.8m
-            # Reset red timer because if we see yellow, we definitely aren't over a red gate
+            gate_altitude_request = CONFIG["vision"]["gates"]["gate_hold_alt"] 
             last_red_seen_time = 0
             
         else: 
-            # Check if we recently saw a red gate
             if (current_time - last_red_seen_time) < GATE_PASS_DELAY:
-                # We are likely ON TOP of the gate now. STAY HIGH.
                 gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
-                print(f"GATE: CROSSING RED... ({current_time - last_red_seen_time:.1f}s)")
+                cv2.putText(frame, "HOLDING ALT...", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
             else:
-                # Safe to return to normal altitude
                 gate_altitude_request = None
-            
-        time.sleep(0.05) # 20 FPS is enough for gates
+        
+        # Update Global Frame for Flask
+        with front_frame_lock:
+            global_front_frame = frame.copy()
+
+        time.sleep(0.05) 
 
 def mavlink_loop(conn, callbacks):
     interesting = list(callbacks.keys())
@@ -353,7 +362,7 @@ def perform_rotation(angle, direction):
     return (abs(angle) / yaw_spd) + 1.5
 
 # ==========================================
-# 4. VISION LOGIC
+# 4. VISION LOGIC (BOTTOM CAMERA)
 # ==========================================
 current_vx = 0.0; current_vy = 0.0
 detected_qr_buffer = None
@@ -371,7 +380,6 @@ def vision_thread_func():
     while True:
         success, frame = cap.read()
         if not success: 
-            # If the camera disconnects during flight, try to reconnect to the SAME index
             print("VISION WARNING: Frame lost. Reconnecting...")
             cap.release()
             time.sleep(0.5)
@@ -412,7 +420,6 @@ def vision_thread_func():
                 cv2.drawContours(roi, [best_cnt], -1, (0,255,255), 2)
                 cv2.line(frame, (cx_scr, real_cy), (cx, real_cy), (0,0,255), 2)
                 
-                # --- CALCULATE LINE ANGLE ---
                 [vx, vy, x, y] = cv2.fitLine(best_cnt, cv2.DIST_L2, 0, 0.01, 0.01)
                 try:
                     angle_rad = m.atan2(vy, vx)
@@ -421,7 +428,6 @@ def vision_thread_func():
                     line_angle_error = angle_deg - 90 
                 except:
                     line_angle_error = 0.0
-                # ---------------------------------
 
                 error_x = cx - cx_scr
                 if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
@@ -488,46 +494,30 @@ def send_vel_cmd():
         return
 
     # DETERMINE TARGET ALTITUDE
-    # Default to takeoff altitude if no gate seen
     req_alt = CONFIG["flight"]["takeoff_alt"] 
-    
     if gate_altitude_request is not None:
         req_alt = gate_altitude_request
         
-    # ALTITUDE P-CONTROLLER
-    # Calculate vertical velocity needed to reach target altitude
-    alt_error = req_alt - web_data["alt"] # "alt" is updated in send_vision_msg
-    
-    # Kp for altitude (e.g., 1.0 means if 1m away, go 1m/s)
-    # Clamp speed to max 0.5 m/s for safety
+    alt_error = req_alt - web_data["alt"] 
     vz = max(min(alt_error * 1.5, 0.5), -0.5)
-    
-    # NOTE: MAVLink NED Frame -> Z is Negative UP. 
-    # Positive Vz = Down, Negative Vz = Up.
-    # If error is positive (Target > Curr), we need to go UP (Negative Z vel)
     mav_vz = -vz
 
-    # PUSH OUT (BLIND FORWARD)
+    # PUSH OUT 
     if mission_state == STATE_PUSH_OUT:
-        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, 0, 0,0,0, 0,0)
+        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, mav_vz, 0,0,0, 0,0)
         return
 
-    # FOLLOW LINE + CONTINUOUS YAW CORRECTION
+    # FOLLOW LINE 
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
-            # === SIMULTANEOUS YAW CORRECTION WITH DEADBAND ===
             yaw_kp = CONFIG["control"].get("yaw_kp", 0.03)
-            
-            # DEADBAND: Ignore errors smaller than 5.0 degrees
             if abs(line_angle_error) > 5.0:
                 yaw_rate = line_angle_error * yaw_kp
             else:
-                yaw_rate = 0.0 # Fly straight if error is small
+                yaw_rate = 0.0 
             
-            # Limit Yaw Rate (Max ~30 deg/s)
             yaw_rate = max(min(yaw_rate, 0.5), -0.5)
-
-            mask = 0b011111000111 # Ignore Pos+Yaw. Use Vel+YawRate.
+            mask = 0b011111000111 
 
             conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, 
                 mavutil.mavlink.MAV_FRAME_BODY_NED, 
@@ -593,7 +583,6 @@ def mission_logic_thread():
             detected_qr_buffer = None 
 
             if navigator.current_node == navigator.target_node:
-                # UPDATED: Go to ALIGN_NORTH instead of LANDING
                 progress("TARGET REACHED. ALIGNING NORTH..."); 
                 mission_state = STATE_ALIGN_NORTH; 
                 continue
@@ -613,8 +602,6 @@ def mission_logic_thread():
                 time.sleep(dur)
                 navigator.current_heading = new_dir 
                 time.sleep(CONFIG["flight"]["post_turn_delay"])
-                
-                # Simplified: Just Push Out after Turn
                 progress("PUSH OUT (BLIND)")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
@@ -625,32 +612,18 @@ def mission_logic_thread():
             
         elif mission_state == STATE_ALIGN_NORTH:
             current = navigator.current_heading
-            
-            # Logic to determine turn needed to face NORTH (DIR_N)
-            req_angle = 0
-            turn_dir = 1 # 1 for CW, -1 for CCW
+            req_angle = 0; turn_dir = 1 
 
-            if current == DIR_N:
-                progress("ALREADY FACING NORTH")
-                req_angle = 0
-            elif current == DIR_E:
-                # Facing East, turn Left 90 to face North
-                progress("FACING EAST -> TURNING LEFT TO NORTH")
-                req_angle = 90; turn_dir = -1
-            elif current == DIR_S:
-                # Facing South, turn 180 to face North
-                progress("FACING SOUTH -> TURNING 180 TO NORTH")
-                req_angle = 180; turn_dir = 1
-            elif current == DIR_W:
-                # Facing West, turn Right 90 to face North
-                progress("FACING WEST -> TURNING RIGHT TO NORTH")
-                req_angle = 90; turn_dir = 1
+            if current == DIR_N: progress("ALREADY FACING NORTH"); req_angle = 0
+            elif current == DIR_E: progress("FACING EAST -> TURNING LEFT"); req_angle = 90; turn_dir = -1
+            elif current == DIR_S: progress("FACING SOUTH -> TURNING 180"); req_angle = 180; turn_dir = 1
+            elif current == DIR_W: progress("FACING WEST -> TURNING RIGHT"); req_angle = 90; turn_dir = 1
             
             if req_angle > 0:
                 dur = perform_rotation(req_angle, turn_dir)
                 time.sleep(dur)
-                navigator.current_heading = DIR_N # Force update state
-                time.sleep(1.0) # Stabilization delay
+                navigator.current_heading = DIR_N 
+                time.sleep(1.0) 
 
             mission_state = STATE_LANDING
 
@@ -683,9 +656,23 @@ def get_display_frame():
         with frame_lock:
             if global_frame is None:
                 img = np.zeros((240, 320, 3), dtype=np.uint8)
+                cv2.putText(img, "NO BOTTOM CAM", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
                 encoded = cv2.imencode('.jpg', img)[1].tobytes()
             else:
                 encoded = cv2.imencode('.jpg', global_frame)[1].tobytes()
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
+        time.sleep(0.1)
+
+# NEW: Generator for Front Camera
+def get_front_display_frame():
+    while True:
+        with front_frame_lock:
+            if global_front_frame is None:
+                img = np.zeros((240, 320, 3), dtype=np.uint8)
+                cv2.putText(img, "NO FRONT CAM", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+                encoded = cv2.imencode('.jpg', img)[1].tobytes()
+            else:
+                encoded = cv2.imencode('.jpg', global_front_frame)[1].tobytes()
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
         time.sleep(0.1)
 
@@ -713,11 +700,25 @@ def index():
     <style>body{background:#111;color:#0f0;font-family:monospace;padding:20px}
     .btn{padding:10px 20px;background:#333;color:#fff;border:1px solid #0f0;cursor:pointer;margin:5px}
     .grid-btn{width:80px;height:60px;margin:5px}
+    .cam-container{display:flex; flex-wrap:wrap;}
+    .cam-box{margin-right:10px; border:2px solid #0f0;}
     </style></head><body>
-    <h1>KING PHOENIX V41: AUTO-START NAV</h1>
-    <img src="/video_feed" style="border:2px solid #0f0;width:640px"><br>
+    <h1>KING PHOENIX V41: OBSTACLE EDITION</h1>
+    
+    <div class="cam-container">
+        <div class="cam-box">
+            <div style="background:#000;color:#fff;padding:2px">BOTTOM CAM (LINE/QR)</div>
+            <img src="/video_feed" width="320">
+        </div>
+        <div class="cam-box">
+            <div style="background:#000;color:#fff;padding:2px">FRONT CAM (GATES)</div>
+            <img src="/video_feed_front" width="320">
+        </div>
+    </div>
+
     <h3>STATUS: <span id="st">INIT</span> | MSG: <span id="msg">-</span></h3>
     <h3>CURRENT: <span id="cur">-</span> | TARGET: <span id="tgt">-</span></h3>
+    <h3>ALT: <span id="alt">0.0</span>m</h3>
     
     <div>
         <button class="btn" onclick="fetch('/start_mission')">START</button>
@@ -740,10 +741,11 @@ def index():
     }
     setInterval(()=>{
         fetch('/status').then(r=>r.json()).then(d=>{
-            document.getElementById('st').innerText=d.state;
+            document.getElementById('st').innerText=d.mode;
             document.getElementById('msg').innerText=d.msg;
             document.getElementById('cur').innerText=d.curr;
             document.getElementById('tgt').innerText=d.target;
+            document.getElementById('alt').innerText=d.alt.toFixed(2);
         });
     }, 500);
     </script>
@@ -752,6 +754,11 @@ def index():
 
 @app.route('/video_feed')
 def video_feed(): return Response(get_display_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ROUTE FOR FRONT CAMERA
+@app.route('/video_feed_front')
+def video_feed_front(): return Response(get_front_display_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 def run_flask(): app.run(host='0.0.0.0', port=CONFIG["system"]["http_port"], threaded=True)
 
 # ==========================================
@@ -762,7 +769,7 @@ default_conn = CONFIG["system"]["mavlink_connect"]
 parser.add_argument('--connect', default=default_conn)
 args = parser.parse_args()
 
-progress("BOOTING KING PHOENIX V41 (AUTO-LOCATOR)...")
+progress("BOOTING KING PHOENIX FIRA 2026...")
 conn = mavutil.mavlink_connection(args.connect, autoreconnect=True, source_system=1, source_component=191)
 callbacks = {'HEARTBEAT': heartbeat_cb, 'STATUSTEXT': statustext_cb, 'GLOBAL_POSITION_INT': global_pos_cb}
 threading.Thread(target=mavlink_loop, args=(conn, callbacks)).start()
@@ -777,7 +784,7 @@ sched.add_job(send_vel_cmd, 'interval', seconds=1/10.0)
 sched.start()
 
 threading.Thread(target=vision_thread_func, daemon=True).start()
-threading.Thread(target=front_camera_thread, daemon=True).start()
+threading.Thread(target=front_camera_thread, daemon=True).start() # <--- FIXED: THIS WAS MISSING
 threading.Thread(target=mission_logic_thread, daemon=True).start()
 
 progress("SYSTEM READY. CALIBRATE T265...")
