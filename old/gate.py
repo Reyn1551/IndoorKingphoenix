@@ -33,8 +33,8 @@ log.setLevel(logging.ERROR)
 # (0,0) -- (1,0) -- (2,0)
 
 GRID_MAP = {
-    "S,W,N,W,1": (0, 1), "ToNorth": (1, 1), "ToEast": (2, 1),
-    "ToWest": (0, 0), "N,S,W,S,3": (1, 0), "ToSouth": (2, 0)
+    "S,W,N,W,1": (0, 2), "ToNorth": (2, 2), "ToEast": (4, 2),
+    "ToWest": (0, 0), "N,S,W,S,3": (2, 0), "BUILDING": (3,0), "ToSouth": (4, 0)
 }
 
 # DIRECTION VECTORS
@@ -75,7 +75,7 @@ class GridNavigator:
 
             for dx, dy in [DIR_N, DIR_E, DIR_S, DIR_W]:
                 next_x, next_y = x + dx, y + dy
-                if 0 <= next_x <= 2 and 0 <= next_y <= 1:
+                if 0 <= next_x <= 4 and 0 <= next_y <= 2:
                     if (next_x, next_y) not in visited:
                         visited.add((next_x, next_y))
                         new_path = list(path)
@@ -198,6 +198,22 @@ STATE_PUSH_OUT = 50
 STATE_ALIGN_NORTH = 60
 STATE_CENTERING = 80
 
+# NEW BUILDING STATES ---
+STATE_BUILDING_INIT = 200
+STATE_BUILDING_ASCEND = 201
+STATE_BUILDING_SCAN_HOVER = 202
+STATE_BUILDING_FIND_EDGE = 203    
+STATE_BUILDING_CREATE_GAP = 204   
+STATE_BUILDING_ALIGN_CENTER = 205 
+STATE_BUILDING_TURN = 206         
+STATE_BUILDING_DESCEND = 207
+STATE_BUILDING_RECOVER = 208
+building_side_count = 0
+found_victims = []
+visited_nodes = set()
+
+
+
 mission_state = STATE_INIT
 mission_start_command = False
 line_detected = False
@@ -210,6 +226,7 @@ GATE_PASS_DELAY = 15.0  # Seconds to stay high after gate disappears
 target_qr_center = None # format: (x, y)
 target_qr_angle = 0.0
 commanded_yaw_rate = 0.0
+wall_qr_center = None # (x, y) or None
 
 prev_error = 0.0; integral_error = 0.0; last_known_direction = 0 
 state_timer = 0.0
@@ -234,98 +251,77 @@ def progress(s):
 # 3. HARDWARE & MAVLINK
 # ==========================================
 
+wall_qr_center = None 
 def front_camera_thread():
-    global gate_altitude_request, last_red_seen_time, global_front_frame
+    global gate_altitude_request, last_red_seen_time, global_front_frame, found_victims, wall_qr_center
     
-    # 1. Initialize Front Camera 
-    FRONT_CAM_INDEX = 4 # Check if this is correct using the checker script!
+    FRONT_CAM_INDEX = 4 
     cap_front = cv2.VideoCapture(FRONT_CAM_INDEX) 
+    if not cap_front.isOpened(): cap_front = cv2.VideoCapture(1)
+    cap_front.set(3, 320); cap_front.set(4, 240)
     
-    # Fallback logic if 2 is missing, try 1 (dangerous if plugged in wrong)
-    if not cap_front.isOpened():
-        print(f"FRONT CAM: Index {FRONT_CAM_INDEX} failed, trying 1...")
-        cap_front = cv2.VideoCapture(1)
-        
-    cap_front.set(3, 320)
-    cap_front.set(4, 240)
-    
-    print("FRONT CAM: Warming up (2s)...")
-    for i in range(60): # discard first ~60 frames
-        cap_front.read()
-        time.sleep(0.01)
-    print("FRONT CAM: Warm-up Complete. Detection Active.")
-
+    print("FRONT CAM: Warming up...")
+    for i in range(30): cap_front.read(); time.sleep(0.01)
     print("FRONT CAM THREAD STARTED")
     
     while True:
         ret, frame = cap_front.read()
-        if not ret: 
-            time.sleep(0.5); continue
+        if not ret: time.sleep(0.5); continue
 
-        # 2. Convert to HSV
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # --- A. VICTIM & CENTERING ---
+        wall_qr_center = None 
+        largest_area = 0
         
-        # 3. Detect Red 
-        lower_r1 = np.array(CONFIG["vision"]["gates"]["red_lower1"])
-        upper_r1 = np.array(CONFIG["vision"]["gates"]["red_upper1"])
-        lower_r2 = np.array(CONFIG["vision"]["gates"]["red_lower2"])
-        upper_r2 = np.array(CONFIG["vision"]["gates"]["red_upper2"])
-        
-        mask_r1 = cv2.inRange(hsv, lower_r1, upper_r1)
-        mask_r2 = cv2.inRange(hsv, lower_r2, upper_r2)
-        mask_red = mask_r1 + mask_r2
-        
-        # 4. Detect Yellow
-        lower_y = np.array(CONFIG["vision"]["gates"]["yellow_lower"])
-        upper_y = np.array(CONFIG["vision"]["gates"]["yellow_upper"])
-        mask_yellow = cv2.inRange(hsv, lower_y, upper_y)
-
-        # 5. Find Contours
-        cnt_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        cnt_yel, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        
-        found_red = False
-        if cnt_red:
-            max_r = max(cnt_red, key=cv2.contourArea)
-            if cv2.contourArea(max_r) > CONFIG["vision"]["gates"]["min_gate_area"]:
-                found_red = True
-                # VISUALIZATION: Draw Red Contour
-                cv2.drawContours(frame, [max_r], -1, (0, 0, 255), 3)
-                cv2.putText(frame, "RED GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        if mission_state >= 200:
+            qr_objs = decode(frame)
+            for obj in qr_objs:
+                qr_data = obj.data.decode("utf-8")
+                if "VICTIM" in qr_data:
+                    cv2.rectangle(frame, (obj.rect.left, obj.rect.top), (obj.rect.left + obj.rect.width, obj.rect.top + obj.rect.height), (0, 255, 0), 2)
+                    if qr_data not in found_victims:
+                        found_victims.append(qr_data)
+                        print(f"!!! FOUND VICTIM: {qr_data} !!!")
                 
-        found_yellow = False
-        if cnt_yel:
-            max_y = max(cnt_yel, key=cv2.contourArea)
-            if cv2.contourArea(max_y) > CONFIG["vision"]["gates"]["min_gate_area"]:
-                found_yellow = True
-                # VISUALIZATION: Draw Yellow Contour
-                cv2.drawContours(frame, [max_y], -1, (0, 255, 255), 3)
-                cv2.putText(frame, "YELLOW GATE", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-        
-        current_time = time.time()
-        
-        # 6. Decision Logic 
-        if found_red:
-            gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
-            last_red_seen_time = current_time 
-            print("GATE: RED (CLIMBING)")
+                area = obj.rect.width * obj.rect.height
+                if area > largest_area:
+                    largest_area = area
+                    cx = obj.rect.left + obj.rect.width / 2
+                    cy = obj.rect.top + obj.rect.height / 2
+                    wall_qr_center = (cx, cy)
             
-        elif found_yellow:
-            gate_altitude_request = CONFIG["vision"]["gates"]["gate_hold_alt"] 
-            last_red_seen_time = 0
-            
-        else: 
-            if (current_time - last_red_seen_time) < GATE_PASS_DELAY:
-                gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
-                cv2.putText(frame, "HOLDING ALT...", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
-            else:
-                gate_altitude_request = None
-        
-        # Update Global Frame for Flask
-        with front_frame_lock:
-            global_front_frame = frame.copy()
+            if wall_qr_center:
+                cv2.circle(frame, (int(wall_qr_center[0]), int(wall_qr_center[1])), 5, (255,0,0), -1)
 
-        time.sleep(0.05) 
+        # --- B. GATE DETECTION ---
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask_r = cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["red_lower1"]), np.array(CONFIG["vision"]["gates"]["red_upper1"])) + \
+                 cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["red_lower2"]), np.array(CONFIG["vision"]["gates"]["red_upper2"]))
+        mask_y = cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["yellow_lower"]), np.array(CONFIG["vision"]["gates"]["yellow_upper"]))
+        
+        cnt_red, _ = cv2.findContours(mask_r, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        cnt_yel, _ = cv2.findContours(mask_y, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        found_red = any(cv2.contourArea(c) > CONFIG["vision"]["gates"]["min_gate_area"] for c in cnt_red)
+        found_yel = any(cv2.contourArea(c) > CONFIG["vision"]["gates"]["min_gate_area"] for c in cnt_yel)
+
+        # [CRITICAL FIX] Only update altitude if NOT in Building Mission
+        if mission_state < 200:
+            if found_red:
+                gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
+                last_red_seen_time = time.time()
+                cv2.putText(frame, "RED GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            elif found_yel:
+                gate_altitude_request = CONFIG["vision"]["gates"]["gate_hold_alt"]
+                last_red_seen_time = 0
+                cv2.putText(frame, "YELLOW GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            else:
+                if (time.time() - last_red_seen_time) < GATE_PASS_DELAY: 
+                    gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
+                else:
+                    gate_altitude_request = None
+
+        with front_frame_lock: global_front_frame = frame.copy()
+        time.sleep(0.05)
 
 def mavlink_loop(conn, callbacks):
     interesting = list(callbacks.keys())
@@ -397,24 +393,16 @@ current_vx = 0.0; current_vy = 0.0
 detected_qr_buffer = None
 
 def vision_thread_func():
-    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error, target_qr_center, target_qr_angle    
+    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error, target_qr_center, target_qr_angle 
     BOTTOM_CAM_INDEX = 6 
-    
-    print(f"VISION THREAD: Opening Bottom Camera (Index {BOTTOM_CAM_INDEX})...")
     cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
     cap.set(3, 320); cap.set(4, 240)
-    print("VISION THREAD STARTED (Bottom Cam OK)")
+    
+    print("VISION THREAD STARTED")
 
     while True:
         success, frame = cap.read()
-        if not success: 
-            print("VISION WARNING: Frame lost. Reconnecting...")
-            cap.release()
-            time.sleep(0.5)
-            cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
-            cap.set(3, 320)
-            cap.set(4, 240)
-            continue
+        if not success: time.sleep(0.5); cap.release(); cap = cv2.VideoCapture(BOTTOM_CAM_INDEX); continue
         
         h, w, _ = frame.shape
         cut_y = int(h * CONFIG["vision"]["roi_height_ratio"])
@@ -454,11 +442,12 @@ def vision_thread_func():
                     angle_deg = m.degrees(angle_rad)
                     if angle_deg < 0: angle_deg += 180
                     line_angle_error = angle_deg - 90 
-                except:
-                    line_angle_error = 0.0
+                except: line_angle_error = 0.0
 
                 error_x = cx - cx_scr
                 if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
+                
+            if mission_state == STATE_FOLLOW_LINE:
                 kp = CONFIG["control"]["pid_kp"]; ki = CONFIG["control"]["pid_ki"]; kd = CONFIG["control"]["pid_kd"]
                 integral_error += error_x; integral_error = max(min(integral_error, 500), -500) 
                 derivative = error_x - prev_error
@@ -467,82 +456,53 @@ def vision_thread_func():
                 current_vy = max(min(raw_vy, max_lat), -max_lat)
                 current_vx = CONFIG["flight"]["forward_speed"]
         else:
-            temp_line_detected = False; integral_error = 0.0; prev_error = 0.0; current_vx = 0.0; current_vy = 0.0
+            temp_line_detected = False
+            # [CHANGE IS HERE] -> Wrap zeroing in this IF
+            if mission_state == STATE_FOLLOW_LINE:
+                current_vx = 0.0; current_vy = 0.0
+                integral_error = 0.0; prev_error = 0.0
+                
             line_angle_error = 0.0
                 
         line_detected = temp_line_detected
 
-        # --- QR DETECTION ---
+        # QR Logic
         qr_objects = decode(frame)
-        target_qr_center = None 
-        target_qr_angle = 0.0 # Reset
+        target_qr_center = None; target_qr_angle = 0.0 
 
         for obj in qr_objects:
             qr_text = obj.data.decode("utf-8")
             pts = np.array([obj.polygon], np.int32)
             cv2.polylines(frame, [pts], True, (255,0,255), 2)
             
-            if qr_text in GRID_MAP:
-                detected_qr_buffer = qr_text
+            if qr_text in GRID_MAP: detected_qr_buffer = qr_text
             
             if qr_text == navigator.target_node:
-                # 1. Calculate Center
                 r = obj.rect
-                cx = r.left + (r.width / 2)
-                cy = r.top + (r.height / 2)
+                cx = r.left + (r.width / 2); cy = r.top + (r.height / 2)
                 target_qr_center = (cx, cy)
                 
-                # 2. Calculate Angle (Yaw Error)
-                # pyzbar polygon order is usually: TL, BL, BR, TR (Z-shape) or TL, BL, BR, TR
-                # We need the top edge. Let's find the two "highest" points (smallest Y values)
                 poly_pts = obj.polygon
-                # Sort points by Y-coordinate (Ascending)
                 sorted_by_y = sorted(poly_pts, key=lambda p: p.y)
-                
-                # The top two points are the first two in the sorted list
-                top_1 = sorted_by_y[0]
-                top_2 = sorted_by_y[1]
-                
-                # Determine which is left and which is right
-                if top_1.x < top_2.x:
-                    tl, tr = top_1, top_2
-                else:
-                    tl, tr = top_2, top_1
-                
-                # Calculate angle of the line connecting TL and TR
-                # In image space: Y grows downwards. 
-                # If TR.y > TL.y, the line slopes "down" (Clockwise tilt)
-                delta_x = tr.x - tl.x
-                delta_y = tr.y - tl.y
-                
-                if delta_x != 0:
-                    # Angle in degrees
-                    target_qr_angle = m.degrees(m.atan2(delta_y, delta_x))
-                
-                # VISUALIZATION
-                cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-                cv2.line(frame, (tl.x, tl.y), (tr.x, tr.y), (0, 255, 0), 2) # Draw Top Edge
-                cv2.putText(frame, f"ANG: {target_qr_angle:.1f}", (int(cx)+10, int(cy)), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                if len(sorted_by_y) >= 2: # Safety check
+                    top_1 = sorted_by_y[0]; top_2 = sorted_by_y[1]
+                    if top_1.x < top_2.x: tl, tr = top_1, top_2
+                    else: tl, tr = top_2, top_1
+                    
+                    delta_x = tr.x - tl.x; delta_y = tr.y - tl.y
+                    if delta_x != 0: target_qr_angle = m.degrees(m.atan2(delta_y, delta_x))
+                    
+                    cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+                    cv2.line(frame, (tl.x, tl.y), (tr.x, tr.y), (0, 255, 0), 2) 
 
-        # --- VISUALIZATION OVERLAY ---
-        cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2) # Center
-
+        cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2) 
         if line_detected:
-            vis_len = 100
-            vis_rad = m.radians(line_angle_error)
+            vis_len = 100; vis_rad = m.radians(line_angle_error)
             tip_x = int(cx_scr + vis_len * m.sin(vis_rad))
             tip_y = int((h/2) - vis_len * m.cos(vis_rad))
             cv2.line(frame, (cx_scr, int(h/2)), (tip_x, tip_y), (255, 0, 0), 2)
 
-        curr_str = navigator.current_node if navigator.current_node else "SCANNING..."
-        right_panel = np.zeros((h, 150, 3), dtype=np.uint8)
-        cv2.putText(right_panel, f"QR: {curr_str}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
-        cv2.putText(right_panel, f"TGT: {navigator.target_node}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255))
-        combined = cv2.hconcat([frame, right_panel])
-        cv2.putText(combined, f"ANG: {line_angle_error:.1f}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-        
-        with frame_lock: global_frame = combined
+        with frame_lock: global_frame = frame
         time.sleep(0.01)
 
 # ==========================================
@@ -567,15 +527,33 @@ def send_vel_cmd():
     vz = max(min(alt_error * 1.5, 0.5), -0.5)
     mav_vz = -vz # NED convention (Negative is Up)
 
+# BUILDING ALTITUDE OVERRIDE
+# BUILDING ALTITUDE OVERRIDE (FIXED FOR YAW)
+    if mission_state >= 200:
+        req_alt = gate_altitude_request if gate_altitude_request else 0.5
+        vz = -max(min((req_alt - web_data["alt"]) * 1.5, 0.5), -0.5)
+        
+        # [FIX START] Check if we are commanding a turn
+        if abs(commanded_yaw_rate) > 0.01:
+             mask = 0b011111000111 # Enable Yaw Rate Control (Bit 10 = 0)
+             y_rate = commanded_yaw_rate
+        else:
+             mask = 0b0000111111000111 # Hold Heading (Bit 10 = 1)
+             y_rate = 0.0
+        # [FIX END]
+
+        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, 
+            mavutil.mavlink.MAV_FRAME_BODY_NED, mask, 0,0,0, current_vx, current_vy, vz, 0,0,0, 0, y_rate)
+        return
+
 # --- 2. BRAKE & HOLD & ROTATE STATES ---
     # (Includes TURNING, SCANNING, ALIGNING)
     if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGN_NORTH]:
         
-        # Determine mask: 
-        # If we are turning, we must ENABLE Yaw Rate (Bit 10 = 0)
-        # If we are not turning, we can IGNORE Yaw Rate (Bit 10 = 1) to hold heading solidly
+        # FIX: Check if we have an active yaw command OR if we are in a turning state
+        is_turning = (mission_state in [STATE_TURNING, STATE_ALIGN_NORTH]) or (abs(commanded_yaw_rate) > 0.01)
         
-        if mission_state in [STATE_TURNING, STATE_ALIGN_NORTH]:
+        if is_turning:
              # Bit 10 is 0 (Enable Yaw Rate Control)
              mask = 0b011111000111 
              y_rate = commanded_yaw_rate
@@ -591,7 +569,7 @@ def send_vel_cmd():
             0,0,0, 
             0, 0, mav_vz, 
             0,0,0, 
-            0, y_rate) # <--- Send the global rate here
+            0, y_rate) 
         return
 
     # --- 3. PUSH OUT ---
@@ -710,7 +688,7 @@ def send_vel_cmd():
         # During Wait User (Disarmed), we send 0 velocity to keep it satisfied
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
 def mission_logic_thread():
-    global mission_state, detected_qr_buffer, mission_start_command, state_timer
+    global mission_state, detected_qr_buffer, mission_start_command, state_timer, current_vx, current_vy, building_side_count, wall_qr_center, gate_altitude_request, visited_nodes
     
     while True:
         time.sleep(0.1)
@@ -775,7 +753,148 @@ def mission_logic_thread():
                 progress("FORWARD (NO TURN)")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
+
+        elif mission_state == STATE_AT_NODE:
+            if navigator.current_node == "BUILDING":
+                # [FIXED LOGIC] Only scan if NOT visited
+                if "BUILDING" not in visited_nodes:
+                    progress("BUILDING FOUND. ORIENTING SOUTH...")
+                    time.sleep(0.5)
+                    
+                    curr = navigator.current_heading
+                    turn_angle = 0; turn_dir = 1
+                    if curr == DIR_N: turn_angle = 180; turn_dir = 1
+                    elif curr == DIR_E: turn_angle = 90; turn_dir = 1 
+                    elif curr == DIR_W: turn_angle = 90; turn_dir = -1
+                    
+                    if turn_angle > 0:
+                        dur = perform_rotation(turn_angle, turn_dir)
+                        time.sleep(dur)
+                    navigator.current_heading = DIR_S
+                    
+                    progress("FACING BUILDING. CLIMBING NOW...")
+                    building_side_count = 0
+                    state_timer = time.time()
+                    mission_state = STATE_BUILDING_ASCEND
+                else:
+                    progress("BUILDING ALREADY VISITED. SKIPPING...")
+                    time.sleep(1.0)
+                    mission_state = STATE_CALCULATING
+
+        elif mission_state == STATE_BUILDING_ASCEND:
+            # [CRITICAL FIX] Force stop moving before climbing
+            current_vx = 0.0
+            current_vy = 0.0
             
+            gate_altitude_request = 1.4
+            
+            if web_data["alt"] >= 1.3:
+                progress(f"SIDE {building_side_count+1}/4: SCANNING...")
+                state_timer = time.time()
+                mission_state = STATE_BUILDING_SCAN_HOVER
+
+        elif mission_state == STATE_BUILDING_SCAN_HOVER:
+            current_vx = 0.0; current_vy = 0.0
+            
+            # Try to center on Wall QR using P-Controller
+            if wall_qr_center is not None:
+                err_x = wall_qr_center[0] - 160 # 320/2
+                # If QR is to the Right (err > 0), strafe Right (+vy)
+                current_vy = max(min(err_x * 0.002, 0.1), -0.1)
+                
+                if abs(err_x) < 20: # Locked
+                    progress("QR LOCKED. STARTING TRANSITION...")
+                    current_vy = 0.0
+                    state_timer = time.time()
+                    mission_state = STATE_BUILDING_CREATE_GAP
+            
+            # If we waited 4 seconds and found nothing, move anyway
+            if time.time() - state_timer > 4.0:
+                progress("NO QR LOCK. BLIND TRANSITION.")
+                state_timer = time.time()
+                mission_state = STATE_BUILDING_CREATE_GAP
+
+        elif mission_state == STATE_BUILDING_CREATE_GAP:
+            # 1. STRAFE RIGHT to clear corner (Timer)
+            current_vx = 0.0; current_vy = 0.15
+            if time.time() - state_timer > 5.5: # Strafe 7s (~1.0m)
+                current_vy = 0.0
+                progress("CORNER CLEARED. MOVING FORWARD...")
+                state_timer = time.time()
+                mission_state = STATE_BUILDING_ALIGN_CENTER
+
+        elif mission_state == STATE_BUILDING_ALIGN_CENTER:
+            # 2. MOVE FORWARD to next side (Timer)
+            current_vx = 0.15; current_vy = 0.0
+            if time.time() - state_timer > 7.25: # Forward 8s (~1.2m)
+                current_vx = 0.0
+                progress("ALIGNED. TURNING...")
+                state_timer = time.time()
+                mission_state = STATE_BUILDING_TURN
+
+        elif mission_state == STATE_BUILDING_TURN:
+            # 3. TURN LEFT
+            dur = perform_rotation(90, -1)
+            time.sleep(dur)
+            building_side_count += 1
+            
+            if building_side_count < 4:
+                progress(f"SIDE {building_side_count+1} READY.")
+                state_timer = time.time()
+                mission_state = STATE_BUILDING_SCAN_HOVER
+            else:
+                progress("ALL SIDES DONE. DESCENDING.")
+                mission_state = STATE_BUILDING_DESCEND
+
+        elif mission_state == STATE_BUILDING_DESCEND:
+            navigator.target_node = "BUILDING"
+            current_alt = web_data["alt"]
+            
+            # P-Controller (Bottom Camera)
+            vx_corr = 0.0; vy_corr = 0.0
+            
+            # Use target_qr_center from global scope
+            if target_qr_center is not None:
+                cx, cy = target_qr_center
+                err_x = cx - 160 
+                err_y = 120 - cy
+                
+                vy_corr = max(min(err_x * 0.0025, 0.15), -0.15) 
+                vx_corr = max(min(err_y * 0.0025, 0.15), -0.15) 
+                
+                # Two-Stage Descent
+                if current_alt > 0.7:
+                     gate_altitude_request = 0.7 # Stage 1: Drop to 0.6
+                else:
+                     # Stage 2: 0.6 -> 0.4
+                     if abs(err_x) < 40 and abs(err_y) < 40:
+                         gate_altitude_request = max(current_alt - 0.05, 0.4) 
+                     else:
+                         gate_altitude_request = current_alt # Pause to center
+            else:
+                gate_altitude_request = 0.7 # Blind drop to 0.6
+                vx_corr = 0.0; vy_corr = 0.0
+
+            current_vx = vx_corr
+            current_vy = vy_corr
+            
+            # Exit Condition
+            if current_alt < 0.45:
+                 progress("REACHED NAV ALT. RECOVERING...")
+                 mission_state = STATE_BUILDING_RECOVER
+                 state_timer = time.time()
+
+        elif mission_state == STATE_BUILDING_RECOVER:
+            current_vx = -0.15 
+            if time.time() - state_timer > 2.0:
+                current_vx = 0.0
+                dur = perform_rotation(180, 1) # Turn back to North
+                time.sleep(1.0)
+                navigator.current_heading = DIR_N
+                visited_nodes.add("BUILDING")
+                navigator.current_node = "BUILDING"
+                mission_state = STATE_CALCULATING
+
         elif mission_state == STATE_ALIGN_NORTH:
             current = navigator.current_heading
             req_angle = 0; turn_dir = 1 
@@ -987,6 +1106,7 @@ sched.start()
 threading.Thread(target=vision_thread_func, daemon=True).start()
 threading.Thread(target=front_camera_thread, daemon=True).start()
 threading.Thread(target=mission_logic_thread, daemon=True).start()
+
 
 progress("SYSTEM READY. CALIBRATE T265...")
 H_aeroRef_T265Ref = np.array([[0,0,-1,0],[1,0,0,0],[0,-1,0,0],[0,0,0,1]])
