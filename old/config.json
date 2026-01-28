@@ -1,6 +1,6 @@
 {
     "control": {
-        "pid_kd": 0.0012,
+        "pid_kd": 0.0015,
         "pid_ki": 1.5e-05,
         "pid_kp": 1e-05,
         "search_fwd_vel": 0.05,
@@ -11,14 +11,14 @@
         "angle_turn": 80,
         "angle_uturn": 170,
         "blind_fwd_time": 2,
-        "forward_speed": 0.1,
+        "forward_speed": 0.11,
         "inbound_dir_scaler": 1,
         "inbound_speed": 0.1,
         "max_lat_vel": 0.3,
         "post_turn_delay": 1,
         "pre_turn_delay": 1,
         "takeoff_alt": 0.4,
-        "yaw_speed": 40
+        "yaw_speed": 30
     },
     "system": {
         "http_port": 5000,
@@ -31,13 +31,22 @@
         "scale_factor": 1
     },
     "vision": {
-        "camera_offset_x": -40,
+        "camera_offset_x": 0,
         "is_black_line": true,
         "lost_timeout": 3,
         "min_area": 1000,
         "min_aspect_ratio": 0.8,
         "qr_confirm_count": 1,
         "roi_height_ratio": 0.3,
-        "threshold_val": 55
+        "threshold_val": 80,
+        "gates": {
+            "red_lower1": [0, 148, 102],   "red_upper1": [179, 255, 255],
+            "red_lower2": [170, 120, 70], "red_upper2": [180, 255, 255],
+            "yellow_lower": [20, 100, 100], "yellow_upper": [30, 255, 255],
+            "min_gate_area": 16000,
+            "gate_hold_alt": 0.4,
+            "gate_avoid_alt": 1.3
+        }    
+        
     }
 }

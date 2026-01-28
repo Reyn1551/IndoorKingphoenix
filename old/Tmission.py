@@ -222,7 +222,7 @@ def find_working_camera():
         cap = cv2.VideoCapture(active_cam_index)
         if cap.isOpened(): return cap
     for index in range(10):
-        cap = cv2.VideoCapture(index)
+        cap = cv2.VideoCapture(6)
         if cap.isOpened():
             ret, frame = cap.read()
             if ret and frame is not None and frame.size > 0:

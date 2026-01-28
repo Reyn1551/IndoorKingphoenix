@@ -6,7 +6,7 @@ def nothing(x):
 
 def hsv_tuner():
     print("=======================================")
-    print("       HSV COLOR TUNER")
+    print("       HSV COLOR TUNER + AREA")
     print("=======================================")
     
     # 1. Select Camera
@@ -46,8 +46,8 @@ def hsv_tuner():
         if not ret: break
 
         # Blur slightly to reduce noise
-        frame = cv2.GaussianBlur(frame, (5, 5), 0)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        blur = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
         # Get current positions of all trackbars
         h_min = cv2.getTrackbarPos('H Min', 'HSV Tuner')
@@ -64,18 +64,33 @@ def hsv_tuner():
         # Create Mask
         mask = cv2.inRange(hsv, lower_bound, upper_bound)
         
+        # --- NEW: CALCULATE AREA ---
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        max_area = 0
+        if contours:
+            max_cnt = max(contours, key=cv2.contourArea)
+            max_area = cv2.contourArea(max_cnt)
+            # Draw the largest contour on the main frame for visual feedback
+            cv2.drawContours(frame, [max_cnt], -1, (0, 255, 0), 2)
+        # ---------------------------
+
         # Show Result
         result = cv2.bitwise_and(frame, frame, mask=mask)
 
         # Stack images for display
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        
+        # Add Text to the Mask Window (Middle image)
+        cv2.putText(mask_bgr, f"MAX AREA: {int(max_area)}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
         stacked = np.hstack([frame, mask_bgr, result])
         
         # Resize to fit screen if needed
         cv2.imshow('HSV Tuner', stacked)
 
-        # Print values to console for easy copying
-        print(f"LOWER: [{h_min}, {s_min}, {v_min}]  ||  UPPER: [{h_max}, {s_max}, {v_max}]", end='\r')
+        # Print values to console for easy copying (Added Area at the end)
+        print(f"LOWER: [{h_min}, {s_min}, {v_min}] || UPPER: [{h_max}, {s_max}, {v_max}] || AREA: {int(max_area)}   ", end='\r')
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -87,6 +102,7 @@ def hsv_tuner():
     print("\n\nFINAL VALUES TO COPY:")
     print(f"lower = [{h_min}, {s_min}, {v_min}]")
     print(f"upper = [{h_max}, {s_max}, {v_max}]")
+    print(f"observed_area = {int(max_area)} (Use slightly less than this for min_gate_area)")
 
 if __name__ == "__main__":
     hsv_tuner()

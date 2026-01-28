@@ -105,7 +105,7 @@ navigator = GridNavigator()
 # ==========================================
 DEFAULT_CONFIG = {
     "flight": {
-        "takeoff_alt": 1.0,         
+        "takeoff_alt": 0.5,         
         "forward_speed": 0.1,       
         "max_lat_vel": 0.3,         
         "yaw_speed": 30,            
@@ -131,12 +131,12 @@ DEFAULT_CONFIG = {
         "lost_timeout": 3.0,        
         "camera_offset_x": 0,
         "gates": {
-            "red_lower1": [0, 120, 70],   "red_upper1": [10, 255, 255],
+            "red_lower1": [0, 148, 102],   "red_upper1": [179, 255, 255],
             "red_lower2": [170, 120, 70], "red_upper2": [180, 255, 255],
             "yellow_lower": [20, 100, 100], "yellow_upper": [30, 255, 255],
-            "min_gate_area": 5000,
+            "min_gate_area": 10000,
             "gate_hold_alt": 0.5,   # Height to fly THROUGH (Yellow)
-            "gate_avoid_alt": 1.6   # Height to fly OVER (Red)
+            "gate_avoid_alt": 1.3   # Height to fly OVER (Red)
         }     
     },
     "t265": {
@@ -205,7 +205,7 @@ fcu_altitude = 0.0
 line_angle_error = 0.0
 gate_altitude_request = None
 last_red_seen_time = 0.0
-GATE_PASS_DELAY = 4.0  # Seconds to stay high after gate disappears
+GATE_PASS_DELAY = 15.0  # Seconds to stay high after gate disappears
 
 prev_error = 0.0; integral_error = 0.0; last_known_direction = 0 
 state_timer = 0.0
@@ -234,7 +234,7 @@ def front_camera_thread():
     global gate_altitude_request, last_red_seen_time, global_front_frame
     
     # 1. Initialize Front Camera 
-    FRONT_CAM_INDEX = 8 # Check if this is correct using the checker script!
+    FRONT_CAM_INDEX = 4 # Check if this is correct using the checker script!
     cap_front = cv2.VideoCapture(FRONT_CAM_INDEX) 
     
     # Fallback logic if 2 is missing, try 1 (dangerous if plugged in wrong)
@@ -357,7 +357,7 @@ def perform_rotation(angle, direction):
     for i in range(3):
         conn.mav.command_long_send(conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
-            abs(angle), yaw_spd, mav_dir, 1, 0, 0, 0)
+            abs(angle-5), yaw_spd, mav_dir, 1, 0, 0, 0)
         time.sleep(0.1)
     return (abs(angle) / yaw_spd) + 1.5
 
@@ -370,7 +370,7 @@ detected_qr_buffer = None
 def vision_thread_func():
     global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error
     
-    BOTTOM_CAM_INDEX = 0 
+    BOTTOM_CAM_INDEX = 6 
     
     print(f"VISION THREAD: Opening Bottom Camera (Index {BOTTOM_CAM_INDEX})...")
     cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
@@ -510,15 +510,15 @@ def send_vel_cmd():
     # FOLLOW LINE 
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
-            yaw_kp = CONFIG["control"].get("yaw_kp", 0.03)
-            if abs(line_angle_error) > 5.0:
+            yaw_kp = CONFIG["control"].get("yaw_kp", 0.025)
+            if abs(line_angle_error) > 10.0:
                 yaw_rate = line_angle_error * yaw_kp
             else:
                 yaw_rate = 0.0 
             
             yaw_rate = max(min(yaw_rate, 0.5), -0.5)
             mask = 0b011111000111 
-
+            print(f"CMD: Vx={current_vx:.2f} Vy={current_vy:.2f} YawRate={yaw_rate:.2f}")
             conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, 
                 mavutil.mavlink.MAV_FRAME_BODY_NED, 
                 mask, 
