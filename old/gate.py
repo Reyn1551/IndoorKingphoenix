@@ -196,6 +196,7 @@ STATE_CALCULATING = 30
 STATE_TURNING = 40
 STATE_PUSH_OUT = 50
 STATE_ALIGN_NORTH = 60
+STATE_CENTERING = 80
 
 mission_state = STATE_INIT
 mission_start_command = False
@@ -206,6 +207,9 @@ line_angle_error = 0.0
 gate_altitude_request = None
 last_red_seen_time = 0.0
 GATE_PASS_DELAY = 15.0  # Seconds to stay high after gate disappears
+target_qr_center = None # format: (x, y)
+target_qr_angle = 0.0
+commanded_yaw_rate = 0.0
 
 prev_error = 0.0; integral_error = 0.0; last_known_direction = 0 
 state_timer = 0.0
@@ -245,6 +249,12 @@ def front_camera_thread():
     cap_front.set(3, 320)
     cap_front.set(4, 240)
     
+    print("FRONT CAM: Warming up (2s)...")
+    for i in range(60): # discard first ~60 frames
+        cap_front.read()
+        time.sleep(0.01)
+    print("FRONT CAM: Warm-up Complete. Detection Active.")
+
     print("FRONT CAM THREAD STARTED")
     
     while True:
@@ -351,15 +361,34 @@ def set_mode(mode):
     conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, conn.mode_mapping()[mode])
 
 def perform_rotation(angle, direction):
+    global commanded_yaw_rate
+    
+    # Direction: 1 = CW (Positive), -1 = CCW (Negative)
+    # BUT in NED Frame: Positive Yaw is Clockwise. 
+    # Let's stick to standard math: Right (CW) is positive speed.
+    
     mav_dir = 1 if direction == 1 else -1 
-    yaw_spd = CONFIG["flight"].get("yaw_speed", 30)
-    progress(f"CMD: YAW {angle} deg")
-    for i in range(3):
-        conn.mav.command_long_send(conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_CMD_CONDITION_YAW, 0, 
-            abs(angle-5), yaw_spd, mav_dir, 1, 0, 0, 0)
-        time.sleep(0.1)
-    return (abs(angle) / yaw_spd) + 1.5
+    yaw_spd_deg = CONFIG["flight"].get("yaw_speed", 30)
+    
+    # Convert to Radians per Second for SET_POSITION_TARGET
+    yaw_rate_rad = m.radians(yaw_spd_deg) * mav_dir
+    
+    progress(f"CMD: YAW {angle} deg (Rate: {yaw_spd_deg}/s)")
+    
+    # Calculate duration
+    duration = abs(angle) / yaw_spd_deg
+    
+    # 1. Start Turning
+    commanded_yaw_rate = yaw_rate_rad
+    
+    # 2. Wait for the turn to complete
+    time.sleep(duration)
+    
+    # 3. Stop Turning
+    commanded_yaw_rate = 0.0
+    
+    # Return delay for settling
+    return 1.5
 
 # ==========================================
 # 4. VISION LOGIC (BOTTOM CAMERA)
@@ -368,8 +397,7 @@ current_vx = 0.0; current_vy = 0.0
 detected_qr_buffer = None
 
 def vision_thread_func():
-    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error
-    
+    global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error, target_qr_center, target_qr_angle    
     BOTTOM_CAM_INDEX = 6 
     
     print(f"VISION THREAD: Opening Bottom Camera (Index {BOTTOM_CAM_INDEX})...")
@@ -446,13 +474,56 @@ def vision_thread_func():
 
         # --- QR DETECTION ---
         qr_objects = decode(frame)
+        target_qr_center = None 
+        target_qr_angle = 0.0 # Reset
+
         for obj in qr_objects:
             qr_text = obj.data.decode("utf-8")
+            pts = np.array([obj.polygon], np.int32)
+            cv2.polylines(frame, [pts], True, (255,0,255), 2)
+            
             if qr_text in GRID_MAP:
                 detected_qr_buffer = qr_text
-                pts = np.array([obj.polygon], np.int32)
-                cv2.polylines(frame, [pts], True, (255,0,255), 2)
-                cv2.putText(frame, qr_text, (obj.rect.left, obj.rect.top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
+            
+            if qr_text == navigator.target_node:
+                # 1. Calculate Center
+                r = obj.rect
+                cx = r.left + (r.width / 2)
+                cy = r.top + (r.height / 2)
+                target_qr_center = (cx, cy)
+                
+                # 2. Calculate Angle (Yaw Error)
+                # pyzbar polygon order is usually: TL, BL, BR, TR (Z-shape) or TL, BL, BR, TR
+                # We need the top edge. Let's find the two "highest" points (smallest Y values)
+                poly_pts = obj.polygon
+                # Sort points by Y-coordinate (Ascending)
+                sorted_by_y = sorted(poly_pts, key=lambda p: p.y)
+                
+                # The top two points are the first two in the sorted list
+                top_1 = sorted_by_y[0]
+                top_2 = sorted_by_y[1]
+                
+                # Determine which is left and which is right
+                if top_1.x < top_2.x:
+                    tl, tr = top_1, top_2
+                else:
+                    tl, tr = top_2, top_1
+                
+                # Calculate angle of the line connecting TL and TR
+                # In image space: Y grows downwards. 
+                # If TR.y > TL.y, the line slopes "down" (Clockwise tilt)
+                delta_x = tr.x - tl.x
+                delta_y = tr.y - tl.y
+                
+                if delta_x != 0:
+                    # Angle in degrees
+                    target_qr_angle = m.degrees(m.atan2(delta_y, delta_x))
+                
+                # VISUALIZATION
+                cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+                cv2.line(frame, (tl.x, tl.y), (tr.x, tr.y), (0, 255, 0), 2) # Draw Top Edge
+                cv2.putText(frame, f"ANG: {target_qr_angle:.1f}", (int(cx)+10, int(cy)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
         # --- VISUALIZATION OVERLAY ---
         cv2.line(frame, (cx_scr, 0), (cx_scr, h), (0, 255, 0), 2) # Center
@@ -485,29 +556,56 @@ def send_vel_cmd():
     global mission_state, current_vx, current_vy, last_known_direction, state_timer
     global fcu_altitude, gate_altitude_request
     
-    if mission_state == STATE_TURNING:
-        return
-    
-    # BRAKE & HOLD
-    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN]:
-        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
-        return
-
-    # DETERMINE TARGET ALTITUDE
+    # --- 1. CALCULATE ALTITUDE CORRECTION FIRST ---
+    # We do this every loop so EVERY state holds altitude
     req_alt = CONFIG["flight"]["takeoff_alt"] 
     if gate_altitude_request is not None:
         req_alt = gate_altitude_request
         
     alt_error = req_alt - web_data["alt"] 
+    # P-Controller for Altitude
     vz = max(min(alt_error * 1.5, 0.5), -0.5)
-    mav_vz = -vz
+    mav_vz = -vz # NED convention (Negative is Up)
 
-    # PUSH OUT 
-    if mission_state == STATE_PUSH_OUT:
-        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, CONFIG["flight"]["forward_speed"], 0, mav_vz, 0,0,0, 0,0)
+# --- 2. BRAKE & HOLD & ROTATE STATES ---
+    # (Includes TURNING, SCANNING, ALIGNING)
+    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGN_NORTH]:
+        
+        # Determine mask: 
+        # If we are turning, we must ENABLE Yaw Rate (Bit 10 = 0)
+        # If we are not turning, we can IGNORE Yaw Rate (Bit 10 = 1) to hold heading solidly
+        
+        if mission_state in [STATE_TURNING, STATE_ALIGN_NORTH]:
+             # Bit 10 is 0 (Enable Yaw Rate Control)
+             mask = 0b011111000111 
+             y_rate = commanded_yaw_rate
+        else:
+             # Bit 10 is 1 (Ignore Yaw Rate -> Hold Heading)
+             mask = 0b0000111111000111
+             y_rate = 0.0
+
+        conn.mav.set_position_target_local_ned_send(
+            0, conn.target_system, conn.target_component, 
+            mavutil.mavlink.MAV_FRAME_BODY_NED, 
+            mask, 
+            0,0,0, 
+            0, 0, mav_vz, 
+            0,0,0, 
+            0, y_rate) # <--- Send the global rate here
         return
 
-    # FOLLOW LINE 
+    # --- 3. PUSH OUT ---
+    if mission_state == STATE_PUSH_OUT:
+        conn.mav.set_position_target_local_ned_send(
+            0, conn.target_system, conn.target_component, 
+            mavutil.mavlink.MAV_FRAME_BODY_NED, 
+            0b0000111111000111, 
+            0,0,0, 
+            CONFIG["flight"]["forward_speed"], 0, mav_vz, 
+            0,0,0, 0,0)
+        return
+
+    # --- 4. FOLLOW LINE ---
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
             yaw_kp = CONFIG["control"].get("yaw_kp", 0.025)
@@ -536,13 +634,81 @@ def send_vel_cmd():
                 0b0000111111000111, 
                 0,0,0, 
                 search_vx, search_vy, mav_vz,
-                0,0,0,
+                0,0,0, 
                 0,0)
 
-    # HOLD
-    elif mission_state in [STATE_WAIT_USER]:
-        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
+    # --- 5. CENTERING (PRECISION LANDING) ---
+    elif mission_state == STATE_CENTERING:
+        if target_qr_center is not None:
+            cam_w, cam_h = 320, 240
+            center_x, center_y = target_qr_center
+            
+            err_x_px = center_x - (cam_w / 2) 
+            err_y_px = (cam_h / 2) - center_y 
+            err_yaw_deg = target_qr_angle 
 
+            # Calculate total distance error (pixels)
+            dist_error = m.sqrt(err_x_px**2 + err_y_px**2)
+            
+            # --- PID GAINS ---
+            # As we get lower, we need more aggressive correction because 
+            # 1 pixel of error means less distance in meters.
+            current_alt = web_data["alt"]
+            
+            # Adaptive P-Gain: Increase gain as altitude decreases
+            # Base 0.0025, max 0.005
+            pos_kp = 0.0025 + (max(0, 0.5 - current_alt) * 0.005)
+            yaw_kp = 0.03 
+            
+            # Calculate Horizontal Velocities
+            prec_vy = max(min(err_x_px * pos_kp, 0.2), -0.2)
+            prec_vx = max(min(err_y_px * pos_kp, 0.2), -0.2)
+            prec_yaw = max(min(err_yaw_deg * yaw_kp, 0.4), -0.4) 
+            
+            # --- DESCENT LOGIC (The "Cone") ---
+            # default mav_vz calculated at top of function tries to HOLD 0.5m.
+            # We override it here based on alignment.
+            
+            target_descend_vel = 0.0
+            
+            if dist_error < 40 and abs(err_yaw_deg) < 10:
+                # If we are roughly centered, descend slowly
+                # Positive Z velocity = DOWN in NED
+                target_descend_vel = 0.15 # Descend at 15 cm/s
+            elif dist_error > 80:
+                # If we drift too far, STOP descending (or climb back if too low)
+                # Use the global mav_vz which pulls us back to takeoff_alt
+                target_descend_vel = mav_vz 
+            else:
+                # In between: Hold current altitude (Velocity 0)
+                target_descend_vel = 0.0
+
+            conn.mav.set_position_target_local_ned_send(
+                0, conn.target_system, conn.target_component, 
+                mavutil.mavlink.MAV_FRAME_BODY_NED, 
+                0b011111000111, 
+                0,0,0, 
+                prec_vx, prec_vy, target_descend_vel, # Send dynamic Z vel
+                0,0,0, 
+                0, prec_yaw) 
+                
+        else:
+            # LOST QR CODE (Missed Approach)
+            # If we lose the QR code, the global 'mav_vz' (calculated at top)
+            # will automatically try to climb back to 'takeoff_alt' (0.5m).
+            # This is a safety feature!
+            conn.mav.set_position_target_local_ned_send(
+                0, conn.target_system, conn.target_component, 
+                mavutil.mavlink.MAV_FRAME_BODY_NED, 
+                0b0000111111000111, 
+                0,0,0, 
+                0, 0, mav_vz, # Climb back to safety height
+                0,0,0, 0,0)
+
+    # --- 6. HOLD (WAIT USER) ---
+    elif mission_state in [STATE_WAIT_USER]:
+        # During Wait User (Disarmed), we send 0 velocity to keep it satisfied
+        conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
 def mission_logic_thread():
     global mission_state, detected_qr_buffer, mission_start_command, state_timer
     
@@ -625,7 +791,42 @@ def mission_logic_thread():
                 navigator.current_heading = DIR_N 
                 time.sleep(1.0) 
 
-            mission_state = STATE_LANDING
+            progress("ALIGN COMPLETE. CENTERING ON QR...")
+            state_timer = time.time()
+            mission_state = STATE_CENTERING
+
+        elif mission_state == STATE_CENTERING:
+            if target_qr_center is not None:
+                cam_w, cam_h = 320, 240
+                cx, cy = target_qr_center
+                
+                # Check Position Error
+                dist_err = m.sqrt((cx - cam_w/2)**2 + (cy - cam_h/2)**2)
+                ang_err = abs(target_qr_angle)
+                current_alt = web_data["alt"]
+                
+                # 
+                # Logic: ALIGNED + LOW ALTITUDE = SUCCESS
+                
+                # 1. Check if perfectly aligned
+                is_aligned = (dist_err < 25 and ang_err < 8.0)
+                
+                # 2. Check if close to ground (e.g., 15cm)
+                is_low = (current_alt < 0.20)
+                
+                if is_aligned and is_low:
+                    progress(f"TOUCHDOWN: Alt={current_alt:.2f}m. CUT MOTORS!")
+                    mission_state = STATE_LANDING
+                
+                # Timeout logic: If it takes too long (>20s), just land to prevent battery drain
+                if time.time() - state_timer > 20.0:
+                    progress("CENTERING TIMEOUT. FORCING LAND.")
+                    mission_state = STATE_LANDING
+            else:
+                # If lost for > 4 seconds, abort
+                if time.time() - state_timer > 4.0:
+                     progress("LOST QR. FORCING LAND.")
+                     mission_state = STATE_LANDING
 
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
@@ -784,7 +985,7 @@ sched.add_job(send_vel_cmd, 'interval', seconds=1/10.0)
 sched.start()
 
 threading.Thread(target=vision_thread_func, daemon=True).start()
-threading.Thread(target=front_camera_thread, daemon=True).start() # <--- FIXED: THIS WAS MISSING
+threading.Thread(target=front_camera_thread, daemon=True).start()
 threading.Thread(target=mission_logic_thread, daemon=True).start()
 
 progress("SYSTEM READY. CALIBRATE T265...")
