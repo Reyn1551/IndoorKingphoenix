@@ -1,1 +1,30 @@
-.idea
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environments
+.venv/
+venv/
+env/
+
+# Build/test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs and flight artifacts
+*.log
+*.tlog
+*.parm
+*.raw
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,10 +1,11 @@
 {
-    "control": {
-        "pid_kd": 0.0015,
+"control": {
+        "pid_kd": 0.0025,
         "pid_ki": 1.5e-05,
         "pid_kp": 1e-05,
         "search_fwd_vel": 0.05,
-        "search_vel": 0.02
+        "search_vel": 0.02,
+        "yaw_kp": 0.015
     },
     "flight": {
         "alt_source": "T265",
