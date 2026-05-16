@@ -2,6 +2,7 @@
 
 ###########################################################
 ##                    KING PHOENIX FIRA 2026             ##
+##      (Grid Nav + Wall Scan + Precision Return)        ##
 ###########################################################
 
 import sys, os, time, threading, math as m, argparse
@@ -28,10 +29,6 @@ log.setLevel(logging.ERROR)
 # ==========================================
 # 0. GRID MAPPING
 # ==========================================
-# (0,1) -- (1,1) -- (2,1)
-#   |        |        |
-# (0,0) -- (1,0) -- (2,0)
-
 GRID_MAP = {
     "S,W,N,W,1": (0, 2), "ToNorth": (2, 2), "ToEast": (4, 2),
     "ToWest": (0, 0), "N,S,W,S,3": (2, 0), "BUILDING": (3,0), "ToSouth": (4, 0)
@@ -107,20 +104,20 @@ DEFAULT_CONFIG = {
     "flight": {
         "takeoff_alt": 0.5,         
         "forward_speed": 0.1,       
-        "max_lat_vel": 0.3,         
+        "max_lat_vel": 0.4,         
         "yaw_speed": 30,            
         "pre_turn_delay": 2.0,      
         "post_turn_delay": 2.0,     
         "blind_fwd_time": 2.5,  
         "alt_source": "T265"        
     },
-"control": {
-        "pid_kp": 0.015,    # INCREASED from 0.008: Makes the drone snap to the center of the line faster
-        "pid_ki": 0.0001,   
-        "pid_kd": 0.005,    # INCREASED from 0.003: Adds more "brakes" to prevent oscillating with the new higher P-gain
+    "control": {
+        "pid_kp": 0.025,    # AGGRESSIVE LINE FOLLOWING
+        "pid_ki": 0.0002,   
+        "pid_kd": 0.005,    
         "search_vel": 0.08,         
         "search_fwd_vel": 0.05,
-        "yaw_kp": 0.015     # DECREASED from 0.03: Softens the rotational speed
+        "yaw_kp": 0.03
     },
     "vision": {
         "is_black_line": True,       
@@ -154,6 +151,14 @@ DEFAULT_CONFIG = {
 CONFIG_FILE = "config.json"
 CONFIG = {}
 
+def deep_update(d, u):
+    for k, v in u.items():
+        if isinstance(v, dict):
+            d[k] = deep_update(d.get(k, {}), v)
+        else:
+            d[k] = v
+    return d
+
 def load_config():
     global CONFIG
     CONFIG = copy.deepcopy(DEFAULT_CONFIG)
@@ -161,8 +166,8 @@ def load_config():
         try:
             with open(CONFIG_FILE, 'r') as f:
                 saved_conf = json.load(f)
-                CONFIG.update(saved_conf)
-                print(f"LOADED CONFIG")
+                deep_update(CONFIG, saved_conf)
+                print(f"LOADED CONFIG (Merged)")
         except: pass
     
     h_str = CONFIG["system"].get("start_heading", "NORTH")
@@ -197,6 +202,7 @@ STATE_TURNING = 40
 STATE_PUSH_OUT = 50
 STATE_ALIGN_NORTH = 60
 STATE_CENTERING = 80
+STATE_PREPARE_RETURN = 85 # <--- NEW STATE FOR RETURN
 
 # NEW BUILDING STATES ---
 STATE_BUILDING_INIT = 200
@@ -211,9 +217,6 @@ STATE_BUILDING_RECOVER = 208
 building_side_count = 0
 found_victims = []
 visited_nodes = set()
-saved_target_node = None
-
-
 
 mission_state = STATE_INIT
 mission_start_command = False
@@ -223,10 +226,9 @@ fcu_altitude = 0.0
 line_angle_error = 0.0
 gate_altitude_request = None
 last_red_seen_time = 0.0
-GATE_PASS_DELAY = 15.0  # Seconds to stay high after gate disappears
+GATE_PASS_DELAY = 13.0  # Seconds to stay high after gate disappears
 target_qr_center = None # format: (x, y)
 target_qr_angle = 0.0
-current_qr_center = None
 commanded_yaw_rate = 0.0
 wall_qr_center = None # (x, y) or None
 
@@ -253,12 +255,11 @@ def progress(s):
 # 3. HARDWARE & MAVLINK
 # ==========================================
 
-
 wall_qr_center = None 
 def front_camera_thread():
     global gate_altitude_request, last_red_seen_time, global_front_frame, found_victims, wall_qr_center
     
-    FRONT_CAM_INDEX = 6
+    FRONT_CAM_INDEX = 4 
     cap_front = cv2.VideoCapture(FRONT_CAM_INDEX) 
     if not cap_front.isOpened(): cap_front = cv2.VideoCapture(1)
     cap_front.set(3, 320); cap_front.set(4, 240)
@@ -267,9 +268,19 @@ def front_camera_thread():
     for i in range(30): cap_front.read(); time.sleep(0.01)
     print("FRONT CAM THREAD STARTED")
     
+    # Prepare CLAHE
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+
     while True:
         ret, frame = cap_front.read()
         if not ret: time.sleep(0.5); continue
+
+        # --- CLAHE ENHANCEMENT ---
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        frame_enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
         # --- A. VICTIM & CENTERING ---
         wall_qr_center = None 
@@ -295,8 +306,8 @@ def front_camera_thread():
             if wall_qr_center:
                 cv2.circle(frame, (int(wall_qr_center[0]), int(wall_qr_center[1])), 5, (255,0,0), -1)
 
-        # --- B. GATE DETECTION ---
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # --- B. GATE DETECTION (Use Enhanced Frame) ---
+        hsv = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2HSV)
         mask_r = cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["red_lower1"]), np.array(CONFIG["vision"]["gates"]["red_upper1"])) + \
                  cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["red_lower2"]), np.array(CONFIG["vision"]["gates"]["red_upper2"]))
         mask_y = cv2.inRange(hsv, np.array(CONFIG["vision"]["gates"]["yellow_lower"]), np.array(CONFIG["vision"]["gates"]["yellow_upper"]))
@@ -304,22 +315,38 @@ def front_camera_thread():
         cnt_red, _ = cv2.findContours(mask_r, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         cnt_yel, _ = cv2.findContours(mask_y, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        found_red = any(cv2.contourArea(c) > CONFIG["vision"]["gates"]["min_gate_area"] for c in cnt_red)
-        found_yel = any(cv2.contourArea(c) > CONFIG["vision"]["gates"]["min_gate_area"] for c in cnt_yel)
+        found_red = False
+        found_yel = False
 
-        # [CRITICAL FIX] Only update altitude if NOT in Building Mission
-        if mission_state < 200:
+        if cnt_red:
+            max_r = max(cnt_red, key=cv2.contourArea)
+            if cv2.contourArea(max_r) > CONFIG["vision"]["gates"]["min_gate_area"]:
+                found_red = True
+                x,y,w,h = cv2.boundingRect(max_r)
+                cv2.rectangle(frame, (x,y), (x+w,y+h), (0,0,255), 2)
+                cv2.putText(frame, "RED", (x,y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+        if cnt_yel:
+            max_y = max(cnt_yel, key=cv2.contourArea)
+            if cv2.contourArea(max_y) > CONFIG["vision"]["gates"]["min_gate_area"]:
+                found_yel = True
+                x,y,w,h = cv2.boundingRect(max_y)
+                cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,255), 2)
+                cv2.putText(frame, "YELLOW", (x,y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+
+        # [CRITICAL FIX] Only update altitude if NOT in Building Mission OR Centering OR Return
+        if mission_state < 200 and mission_state not in [STATE_CENTERING, STATE_PREPARE_RETURN]:
             if found_red:
                 gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
                 last_red_seen_time = time.time()
-                cv2.putText(frame, "RED GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                cv2.putText(frame, "AVOIDING...", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
             elif found_yel:
                 gate_altitude_request = CONFIG["vision"]["gates"]["gate_hold_alt"]
                 last_red_seen_time = 0
-                cv2.putText(frame, "YELLOW GATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
             else:
                 if (time.time() - last_red_seen_time) < GATE_PASS_DELAY: 
                     gate_altitude_request = CONFIG["vision"]["gates"]["gate_avoid_alt"]
+                    cv2.putText(frame, "LATCH HOLD", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
                 else:
                     gate_altitude_request = None
 
@@ -362,10 +389,6 @@ def set_mode(mode):
 def perform_rotation(angle, direction):
     global commanded_yaw_rate
     
-    # Direction: 1 = CW (Positive), -1 = CCW (Negative)
-    # BUT in NED Frame: Positive Yaw is Clockwise. 
-    # Let's stick to standard math: Right (CW) is positive speed.
-    
     mav_dir = 1 if direction == 1 else -1 
     yaw_spd_deg = CONFIG["flight"].get("yaw_speed", 30)
     
@@ -397,11 +420,7 @@ detected_qr_buffer = None
 
 def vision_thread_func():
     global current_vx, current_vy, line_detected, last_line_time, prev_error, integral_error, last_known_direction, global_frame, detected_qr_buffer, line_angle_error, target_qr_center, target_qr_angle 
-    smoothed_angle_error = 0.0
-    smoothed_error_x = 0.0
-    FILTER_ALPHA = 0.35  # Lower = smoother but more delay. 0.35 is a good balance.
-    frames_lost = 0      # Used for the grace period below
-    BOTTOM_CAM_INDEX = 4
+    BOTTOM_CAM_INDEX = 6 
     cap = cv2.VideoCapture(BOTTOM_CAM_INDEX)
     cap.set(3, 320); cap.set(4, 240)
     
@@ -448,29 +467,18 @@ def vision_thread_func():
                     angle_rad = m.atan2(vy, vx)
                     angle_deg = m.degrees(angle_rad)
                     if angle_deg < 0: angle_deg += 180
-                    raw_angle_error = angle_deg - 90 
-                    
-                    # --- NEW: Smooth the Yaw Angle ---
-                    smoothed_angle_error = (FILTER_ALPHA * raw_angle_error) + ((1.0 - FILTER_ALPHA) * smoothed_angle_error)
-                    line_angle_error = smoothed_angle_error
+                    line_angle_error = angle_deg - 90 
                 except: line_angle_error = 0.0
 
-                raw_error_x = cx - cx_scr
-                # --- NEW: Smooth the Lateral (Strafe) Error ---
-                smoothed_error_x = (FILTER_ALPHA * raw_error_x) + ((1.0 - FILTER_ALPHA) * smoothed_error_x)
-                
-                if abs(smoothed_error_x) > 10: last_known_direction = 1 if smoothed_error_x > 0 else -1
+                error_x = cx - cx_scr
+                if abs(error_x) > 10: last_known_direction = 1 if error_x > 0 else -1
                 
             if mission_state == STATE_FOLLOW_LINE:
                 kp = CONFIG["control"]["pid_kp"]; ki = CONFIG["control"]["pid_ki"]; kd = CONFIG["control"]["pid_kd"]
-                
-                # USE smoothed_error_x for your PID instead of raw error_x
-                integral_error += smoothed_error_x; integral_error = max(min(integral_error, 500), -500) 
-                derivative = smoothed_error_x - prev_error
-                raw_vy = (smoothed_error_x * kp) + (integral_error * ki) + (derivative * kd)
-                prev_error = smoothed_error_x
-                
-                max_lat = CONFIG["flight"]["max_lat_vel"]
+                integral_error += error_x; integral_error = max(min(integral_error, 500), -500) 
+                derivative = error_x - prev_error
+                raw_vy = (error_x * kp) + (integral_error * ki) + (derivative * kd)
+                prev_error = error_x; max_lat = CONFIG["flight"]["max_lat_vel"]
                 current_vy = max(min(raw_vy, max_lat), -max_lat)
                 current_vx = CONFIG["flight"]["forward_speed"]
         else:
@@ -485,10 +493,8 @@ def vision_thread_func():
         line_detected = temp_line_detected
 
         # QR Logic
-        global current_qr_center # Make sure this is declared
         qr_objects = decode(frame)
         target_qr_center = None; target_qr_angle = 0.0 
-        current_qr_center = None # Reset every frame
 
         for obj in qr_objects:
             qr_text = obj.data.decode("utf-8")
@@ -496,12 +502,6 @@ def vision_thread_func():
             cv2.polylines(frame, [pts], True, (255,0,255), 2)
             
             if qr_text in GRID_MAP: detected_qr_buffer = qr_text
-
-            if qr_text == navigator.current_node:
-                r = obj.rect
-                cx = r.left + (r.width / 2); cy = r.top + (r.height / 2)
-                current_qr_center = (cx, cy)
-                cv2.circle(frame, (int(cx), int(cy)), 5, (255, 165, 0), -1) # Orange dot for visual debug
             
             if qr_text == navigator.target_node:
                 r = obj.rect
@@ -573,12 +573,11 @@ def send_vel_cmd():
         return
 
 # --- 2. BRAKE & HOLD & ROTATE STATES ---
-    # (Includes TURNING, SCANNING, ALIGNING)    
-    if mission_state in [STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGN_NORTH]:
-
-      
+    # (Includes TURNING, SCANNING, ALIGNING)
+    if mission_state in [STATE_AT_NODE, STATE_CALCULATING, STATE_TURNING, STATE_INITIAL_SCAN, STATE_ALIGN_NORTH, STATE_PREPARE_RETURN]:
+        
         # FIX: Check if we have an active yaw command OR if we are in a turning state
-        is_turning = (mission_state in [STATE_TURNING, STATE_ALIGN_NORTH]) or (abs(commanded_yaw_rate) > 0.01)
+        is_turning = (mission_state in [STATE_TURNING, STATE_ALIGN_NORTH, STATE_PREPARE_RETURN]) or (abs(commanded_yaw_rate) > 0.01)
         
         if is_turning:
              # Bit 10 is 0 (Enable Yaw Rate Control)
@@ -598,25 +597,7 @@ def send_vel_cmd():
             0,0,0, 
             0, y_rate) 
         return
-# --- 2.5 NODE CENTERING ---
-    elif mission_state == STATE_AT_NODE:
-        # Allow X and Y velocities to center on the QR code.
-        # Hold heading UNLESS a rotation is actively commanded.
-        if abs(commanded_yaw_rate) > 0.01:
-            mask = 0b011111000111 # Bit 10 is 0: Enable Yaw Rate Control
-            y_rate = commanded_yaw_rate
-        else:
-            mask = 0b0000111111000111 # Bit 10 is 1: Hold Heading
-            y_rate = 0.0
-            
-        conn.mav.set_position_target_local_ned_send(
-            0, conn.target_system, conn.target_component, 
-            mavutil.mavlink.MAV_FRAME_BODY_NED, 
-            mask, 
-            0,0,0, 
-            current_vx, current_vy, mav_vz, 
-            0,0,0, 0, y_rate)
-        return
+
     # --- 3. PUSH OUT ---
     if mission_state == STATE_PUSH_OUT:
         conn.mav.set_position_target_local_ned_send(
@@ -631,18 +612,11 @@ def send_vel_cmd():
     # --- 4. FOLLOW LINE ---
     if mission_state == STATE_FOLLOW_LINE:
         if line_detected:
-            yaw_kp = CONFIG["control"].get("yaw_kp", 0.015)
-            deadband = 8.0 # Degrees of tolerance before it cares
-            
-            if abs(line_angle_error) > deadband:
-                # Smooth deadband: Subtract the tolerance from the error.
-                # If the error is 9 degrees, it only corrects for 1 degree of error, 
-                # preventing violent snaps when the line slightly bends.
-                active_error = abs(line_angle_error) - deadband
-                yaw_dir = 1 if line_angle_error > 0 else -1
-                yaw_rate = active_error * yaw_kp * yaw_dir
+            yaw_kp = CONFIG["control"].get("yaw_kp", 0.025)
+            if abs(line_angle_error) > 10.0:
+                yaw_rate = line_angle_error * yaw_kp
             else:
-                yaw_rate = 0.0
+                yaw_rate = 0.0 
             
             yaw_rate = max(min(yaw_rate, 0.5), -0.5)
             mask = 0b011111000111 
@@ -664,7 +638,7 @@ def send_vel_cmd():
                 0b0000111111000111, 
                 0,0,0, 
                 search_vx, search_vy, mav_vz,
-                0,0,0, 
+                0,0,0,
                 0,0)
 
     # --- 5. CENTERING (PRECISION LANDING) ---
@@ -681,12 +655,9 @@ def send_vel_cmd():
             dist_error = m.sqrt(err_x_px**2 + err_y_px**2)
             
             # --- PID GAINS ---
-            # As we get lower, we need more aggressive correction because 
-            # 1 pixel of error means less distance in meters.
             current_alt = web_data["alt"]
             
             # Adaptive P-Gain: Increase gain as altitude decreases
-            # Base 0.0025, max 0.005
             pos_kp = 0.0025 + (max(0, 0.5 - current_alt) * 0.005)
             yaw_kp = 0.03 
             
@@ -695,38 +666,21 @@ def send_vel_cmd():
             prec_vx = max(min(err_y_px * pos_kp, 0.2), -0.2)
             prec_yaw = max(min(err_yaw_deg * yaw_kp, 0.4), -0.4) 
             
-            # --- DESCENT LOGIC (The "Cone") ---
-            # default mav_vz calculated at top of function tries to HOLD 0.5m.
-            # We override it here based on alignment.
+            # --- ALWAYS DESCEND LOGIC ---
+            # descend slowly and continuously
+            target_descend_vel = 0.15 # 15 cm/s descent
             
-            target_descend_vel = 0.0
-            
-            if dist_error < 40 and abs(err_yaw_deg) < 10:
-                # If we are roughly centered, descend slowly
-                # Positive Z velocity = DOWN in NED
-                target_descend_vel = 0.15 # Descend at 15 cm/s
-            elif dist_error > 80:
-                # If we drift too far, STOP descending (or climb back if too low)
-                # Use the global mav_vz which pulls us back to takeoff_alt
-                target_descend_vel = mav_vz 
-            else:
-                # In between: Hold current altitude (Velocity 0)
-                target_descend_vel = 0.0
-
             conn.mav.set_position_target_local_ned_send(
                 0, conn.target_system, conn.target_component, 
                 mavutil.mavlink.MAV_FRAME_BODY_NED, 
                 0b011111000111, 
                 0,0,0, 
-                prec_vx, prec_vy, target_descend_vel, # Send dynamic Z vel
+                prec_vx, prec_vy, target_descend_vel, # Force Descent
                 0,0,0, 
                 0, prec_yaw) 
                 
         else:
             # LOST QR CODE (Missed Approach)
-            # If we lose the QR code, the global 'mav_vz' (calculated at top)
-            # will automatically try to climb back to 'takeoff_alt' (0.5m).
-            # This is a safety feature!
             conn.mav.set_position_target_local_ned_send(
                 0, conn.target_system, conn.target_component, 
                 mavutil.mavlink.MAV_FRAME_BODY_NED, 
@@ -740,7 +694,8 @@ def send_vel_cmd():
         # During Wait User (Disarmed), we send 0 velocity to keep it satisfied
         conn.mav.set_position_target_local_ned_send(0, conn.target_system, conn.target_component, mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0000111111000111, 0,0,0, 0, 0, 0, 0,0,0, 0,0)
 def mission_logic_thread():
-    global mission_state, detected_qr_buffer, mission_start_command, state_timer, current_vx, current_vy, building_side_count, wall_qr_center, gate_altitude_request, visited_nodes, commanded_yaw_rate, saved_target_node    
+    global mission_state, detected_qr_buffer, mission_start_command, state_timer, current_vx, current_vy, building_side_count, wall_qr_center, gate_altitude_request, visited_nodes
+    
     while True:
         time.sleep(0.1)
         
@@ -778,8 +733,13 @@ def mission_logic_thread():
             detected_qr_buffer = None 
 
             if navigator.current_node == navigator.target_node:
-                progress("TARGET REACHED. ALIGNING NORTH..."); 
-                mission_state = STATE_ALIGN_NORTH; 
+                # [MODIFIED LOGIC: Return to South]
+                if navigator.target_node == "ToSouth":
+                    progress("MISSION COMPLETE. LANDING AT SOUTH.")
+                    mission_state = STATE_LANDING
+                else:
+                    progress("TARGET REACHED. ALIGNING NORTH...")
+                    mission_state = STATE_ALIGN_NORTH
                 continue
 
             path_coords = navigator.calculate_path()
@@ -804,68 +764,36 @@ def mission_logic_thread():
                 progress("FORWARD (NO TURN)")
                 mission_state = STATE_PUSH_OUT
                 state_timer = time.time()
-
+            
         elif mission_state == STATE_AT_NODE:
-            # 1. PID Centering Logic
-            if current_qr_center is not None:
-                cx, cy = current_qr_center
-                err_x = cx - 160  
-                err_y = 120 - cy  
-                
-                # INCREASED P-Gain from 0.002 to 0.0035 to give it more "push" when close
-                current_vy = max(min(err_x * 0.00075, 0.15), -0.15) 
-                current_vx = max(min(err_y * 0.00075, 0.15), -0.15) 
-                
-                dist_err = m.sqrt(err_x**2 + err_y**2)
-                # TIGHTENED radius from 25 to 10 pixels for high precision
-                print(f"Centering Error: {dist_err:.2f} px, Vx: {current_vx:.2f}, Vy: {current_vy:.2f}")
-                is_centered = dist_err < 50 
-            else:
-                current_vx = 0.0
-                current_vy = 0.0
-                is_centered = False
-                
-            # 2. State Transition Logic
-            # EXTENDED timeout to 8 seconds so it actually has time to reach the center
-            if is_centered or (time.time() - state_timer > 4.0):
-                
-                current_vx = 0.0; current_vy = 0.0 # Stop moving
-                progress("NODE CENTERED. PROCEEDING...")
-                
-                if navigator.current_node == "BUILDING":
-                    if "BUILDING" not in visited_nodes:
-                        progress("BUILDING FOUND. ORIENTING SOUTH...")
-
-                        saved_target_node = navigator.target_node
-
-                        time.sleep(0.5)
-                        
-                        curr = navigator.current_heading
-                        turn_angle = 0; turn_dir = 1
-                        if curr == DIR_N: turn_angle = 180; turn_dir = 1
-                        elif curr == DIR_E: turn_angle = 90; turn_dir = 1 
-                        elif curr == DIR_W: turn_angle = 90; turn_dir = -1
-                        
-                        if turn_angle > 0:
-                            dur = perform_rotation(turn_angle, turn_dir)
-                            time.sleep(dur)
-                        navigator.current_heading = DIR_S
-                        
-                        progress("FACING BUILDING. STEPPING BACK TO CLEAR WALL...")
-                        current_vx = -0.15 
-                        time.sleep(1.0) # 1 second physical clearance
-                        current_vx = 0.0
-                        
-                        progress("CLIMBING TO TARGET ALTITUDE...")
-                        building_side_count = 0
-                        state_timer = time.time()
-                        mission_state = STATE_BUILDING_ASCEND
-                    else:
-                        progress("BUILDING ALREADY VISITED. SKIPPING...")
-                        time.sleep(1.0)
-                        mission_state = STATE_CALCULATING
+            if navigator.current_node == "BUILDING":
+                # [FIXED LOGIC] Only scan if NOT visited
+                if "BUILDING" not in visited_nodes:
+                    progress("BUILDING FOUND. ORIENTING SOUTH...")
+                    time.sleep(0.5)
+                    
+                    curr = navigator.current_heading
+                    turn_angle = 0; turn_dir = 1
+                    if curr == DIR_N: turn_angle = 180; turn_dir = 1
+                    elif curr == DIR_E: turn_angle = 90; turn_dir = 1 
+                    elif curr == DIR_W: turn_angle = 90; turn_dir = -1
+                    
+                    if turn_angle > 0:
+                        dur = perform_rotation(turn_angle, turn_dir)
+                        time.sleep(dur)
+                    navigator.current_heading = DIR_S
+                    
+                    progress("FACING BUILDING. CLIMBING NOW...")
+                    building_side_count = 0
+                    state_timer = time.time()
+                    mission_state = STATE_BUILDING_ASCEND
                 else:
-                    time.sleep(0.5) # Brief pause for stability
+                    progress("BUILDING ALREADY VISITED. SKIPPING...")
+                    time.sleep(1.0)
+                    mission_state = STATE_CALCULATING
+            else:
+                # Standard node wait
+                if time.time() - state_timer > 2.0:
                     mission_state = STATE_CALCULATING
 
         elif mission_state == STATE_BUILDING_ASCEND:
@@ -873,48 +801,38 @@ def mission_logic_thread():
             current_vx = 0.0
             current_vy = 0.0
             
-            gate_altitude_request = 1.35
+            gate_altitude_request = 1.4
             
-            if web_data["alt"] >= 1.2:
+            if web_data["alt"] >= 1.3:
                 progress(f"SIDE {building_side_count+1}/4: SCANNING...")
                 state_timer = time.time()
                 mission_state = STATE_BUILDING_SCAN_HOVER
 
         elif mission_state == STATE_BUILDING_SCAN_HOVER:
-            # 1. Reverse slowly for a maximum of 3 seconds
-            if time.time() - state_timer <= 3.0:
-                current_vx = -0.15 
-            else:
-                current_vx = 0.0 # Reached max reverse limit, hit the brakes!
-                
-            current_vy = 0.0
+            current_vx = 0.0; current_vy = 0.0
             
-            # 2. Dynamic Lock & Center
+            # Try to center on Wall QR using P-Controller
             if wall_qr_center is not None:
-                current_vx = 0.0 # Stop reversing immediately the moment it is seen!
-                
-                # Center laterally on the QR
-                err_x = wall_qr_center[0] - 160 
+                err_x = wall_qr_center[0] - 160 # 320/2
+                # If QR is to the Right (err > 0), strafe Right (+vy)
                 current_vy = max(min(err_x * 0.002, 0.1), -0.1)
                 
                 if abs(err_x) < 20: # Locked
-                    progress("TOP QR LOCKED. STARTING TRANSITION...")
+                    progress("QR LOCKED. STARTING TRANSITION...")
                     current_vy = 0.0
                     state_timer = time.time()
                     mission_state = STATE_BUILDING_CREATE_GAP
             
-            # 3. Failsafe Timeout
-            # Total of 6 seconds (3s backing up + 3s hovering) before giving up
-            elif time.time() - state_timer > 6.0:
-                progress("NO QR SEEN AT TOP. BLIND TRANSITION.")
-                current_vx = 0.0
+            # If we waited 4 seconds and found nothing, move anyway
+            if time.time() - state_timer > 4.0:
+                progress("NO QR LOCK. BLIND TRANSITION.")
                 state_timer = time.time()
                 mission_state = STATE_BUILDING_CREATE_GAP
 
         elif mission_state == STATE_BUILDING_CREATE_GAP:
             # 1. STRAFE RIGHT to clear corner (Timer)
             current_vx = 0.0; current_vy = 0.15
-            if time.time() - state_timer > 5: # Strafe 7s (~1.0m)
+            if time.time() - state_timer > 5.5: # Strafe 7s (~1.0m)
                 current_vy = 0.0
                 progress("CORNER CLEARED. MOVING FORWARD...")
                 state_timer = time.time()
@@ -947,139 +865,49 @@ def mission_logic_thread():
             navigator.target_node = "BUILDING"
             current_alt = web_data["alt"]
             
-            # Inisialisasi awal target altitude
-            if gate_altitude_request is None or gate_altitude_request > 0.8:
-                gate_altitude_request = 0.8
-
-            target_vx = 0.0
-            target_vy = 0.0
-
+            # P-Controller (Bottom Camera)
+            vx_corr = 0.0; vy_corr = 0.0
+            
+            # Use target_qr_center from global scope
             if target_qr_center is not None:
                 cx, cy = target_qr_center
                 err_x = cx - 160 
                 err_y = 120 - cy
                 
-                # GAIN DITURUNKAN agar tidak over-correct (goyang kiri-kanan)
-                pos_kp = 0.0015 + (max(0, 1.0 - current_alt) * 0.002)
+                vy_corr = max(min(err_x * 0.0025, 0.15), -0.15) 
+                vx_corr = max(min(err_y * 0.0025, 0.15), -0.15) 
                 
-                # BATAS KECEPATAN DITURUNKAN max 15 cm/s
-                target_vy = max(min(err_x * pos_kp, 0.15), -0.15) 
-                target_vx = max(min(err_y * pos_kp, 0.15), -0.15) 
-                
-                dist_err = m.sqrt(err_x**2 + err_y**2)
-                
-                # LOGIKA DESCEND PINTAR: Turun hanya jika di tengah
-                if dist_err < 40: 
-                    # Jika sangat di tengah, turun normal
-                    if gate_altitude_request > 0.4: gate_altitude_request -= 0.015 
-                elif dist_err < 80:
-                    # Jika agak melenceng, turun pelan-pelan
-                    if gate_altitude_request > 0.4: gate_altitude_request -= 0.005 
-                # Jika dist_err > 80, altitude hold (berhenti turun) sampai posisi tengah lagi
+                # Two-Stage Descent
+                if current_alt > 0.7:
+                     gate_altitude_request = 0.7 # Stage 1: Drop to 0.6
+                else:
+                     # Stage 2: 0.6 -> 0.4
+                     if abs(err_x) < 40 and abs(err_y) < 40:
+                         gate_altitude_request = max(current_alt - 0.05, 0.4) 
+                     else:
+                         gate_altitude_request = current_alt # Pause to center
+            else:
+                gate_altitude_request = 0.7 # Blind drop to 0.6
+                vx_corr = 0.0; vy_corr = 0.0
+
+            current_vx = vx_corr
+            current_vy = vy_corr
             
-            # --- LOW-PASS FILTER (MENGHILANGKAN PERGERAKAN KASAR) ---
-            # Kecepatan transisi mulus, tidak patah-patah
-            current_vx = (current_vx * 0.7) + (target_vx * 0.3)
-            current_vy = (current_vy * 0.7) + (target_vy * 0.3)
-            
+            # Exit Condition
             if current_alt < 0.45:
                  progress("REACHED NAV ALT. RECOVERING...")
                  mission_state = STATE_BUILDING_RECOVER
                  state_timer = time.time()
-                 current_vx = 0.0 # Rem total sebelum masuk state berikutnya
-                 current_vy = 0.0
 
         elif mission_state == STATE_BUILDING_RECOVER:
-            # 1. Update Map (Kita sedang di BUILDING)
-            visited_nodes.add("BUILDING")
-            navigator.current_node = "BUILDING"
-            
-            # 2. Kembalikan target asli ke "ToSouth" (atau apapun target akhirmu)
-            if saved_target_node is not None:
-                navigator.target_node = saved_target_node
-
-            # 3. Kalkulasi arah ke node tujuan
-            path_coords = navigator.calculate_path()
-
-            if len(path_coords) >= 2:
-                next_coord = path_coords[1]
-                req_angle, new_dir = navigator.get_turn_angle(next_coord)
-            else:
-                req_angle = 0 # Jangan paksa balik 180 derajat kalau tidak ada path
-                new_dir = navigator.current_heading
-
-            if req_angle != 0:
-                yaw_spd_deg = 15.0 
-                turn_dir = 1 if req_angle > 0 else -1
-                target_yaw_rad = m.radians(yaw_spd_deg) * turn_dir
-                
-                progress(f"TURNING TO TARGET NODE: {req_angle} DEG...")
-                
-                angle_turned = 0.0
-                last_time = time.time()
-                last_known_cx, last_known_cy = 160, 120 
-                qr_lost_time = time.time()
-
-                while angle_turned < abs(req_angle):
-                    current_time = time.time()
-                    dt = current_time - last_time
-                    last_time = current_time
-                    
-                    # --- PERUBAHAN KRITIS: GUNAKAN CURRENT_QR BUKAN TARGET_QR ---
-                    # Karena target_qr sekarang adalah ToSouth, kita harus jangkar ke BUILDING
-                    if current_qr_center is not None:
-                        cx, cy = current_qr_center
-                        last_known_cx, last_known_cy = cx, cy
-                        qr_lost_time = current_time 
-                    else:
-                        if current_time - qr_lost_time < 1.0:
-                            cx, cy = last_known_cx, last_known_cy
-                        else:
-                            cx, cy = 160, 120 
-
-                    err_x = cx - 160 
-                    err_y = 120 - cy
-                    dist_err = m.sqrt(err_x**2 + err_y**2)
-                    current_alt = web_data["alt"]
-                    
-                    pos_kp = 0.002 + (max(0, 1.0 - current_alt) * 0.003)
-                    target_vx, target_vy = 0.0, 0.0
-                    
-                    if dist_err > 50:
-                        # Drift terlalu jauh! Pause rotasi, tarik ke tengah
-                        commanded_yaw_rate = 0.0
-                        target_vy = max(min(err_x * (pos_kp * 1.5), 0.15), -0.15) 
-                        target_vx = max(min(err_y * (pos_kp * 1.5), 0.15), -0.15) 
-                    else:
-                        # Aman, lanjutkan putaran
-                        commanded_yaw_rate = target_yaw_rad
-                        angle_turned += yaw_spd_deg * dt 
-                        
-                        comp_x = err_y * 0.1 * turn_dir 
-                        comp_y = -err_x * 0.1 * turn_dir
-                        
-                        target_vy = max(min((err_x + comp_x) * pos_kp, 0.15), -0.15) 
-                        target_vx = max(min((err_y + comp_y) * pos_kp, 0.15), -0.15) 
-
-                    # Terapkan Low-Pass Filter agar putaran stabil
-                    current_vx = (current_vx * 0.6) + (target_vx * 0.4)
-                    current_vy = (current_vy * 0.6) + (target_vy * 0.4)
-
-                    time.sleep(0.05) 
-                    
-                commanded_yaw_rate = 0.0
-                current_vx = 0.0 
-                current_vy = 0.0
-                time.sleep(1.0) 
-
-            navigator.current_heading = new_dir
-            
-            if len(path_coords) >= 2:
-                progress("PUSH OUT TO TARGET NODE...")
-                state_timer = time.time()
-                mission_state = STATE_PUSH_OUT
-            else:
-                progress("MISSION COMPLETE.")
+            current_vx = -0.15 
+            if time.time() - state_timer > 2.0:
+                current_vx = 0.0
+                dur = perform_rotation(180, 1) # Turn back to North
+                time.sleep(1.0)
+                navigator.current_heading = DIR_N
+                visited_nodes.add("BUILDING")
+                navigator.current_node = "BUILDING"
                 mission_state = STATE_CALCULATING
 
         elif mission_state == STATE_ALIGN_NORTH:
@@ -1108,31 +936,46 @@ def mission_logic_thread():
                 
                 # Check Position Error
                 dist_err = m.sqrt((cx - cam_w/2)**2 + (cy - cam_h/2)**2)
-                ang_err = abs(target_qr_angle)
                 current_alt = web_data["alt"]
                 
-                # 
                 # Logic: ALIGNED + LOW ALTITUDE = SUCCESS
-                
-                # 1. Check if perfectly aligned
-                is_aligned = (dist_err < 25 and ang_err < 8.0)
-                
-                # 2. Check if close to ground (e.g., 15cm)
+                is_aligned = (dist_err < 25)
                 is_low = (current_alt < 0.20)
                 
                 if is_aligned and is_low:
-                    progress(f"TOUCHDOWN: Alt={current_alt:.2f}m. CUT MOTORS!")
-                    mission_state = STATE_LANDING
+                    progress(f"CENTERED. PREPARING RETURN...")
+                    mission_state = STATE_PREPARE_RETURN
                 
-                # Timeout logic: If it takes too long (>20s), just land to prevent battery drain
+                # Timeout logic
                 if time.time() - state_timer > 20.0:
-                    progress("CENTERING TIMEOUT. FORCING LAND.")
-                    mission_state = STATE_LANDING
+                    progress("CENTERING TIMEOUT. RETURNING ANYWAY.")
+                    mission_state = STATE_PREPARE_RETURN
             else:
                 # If lost for > 4 seconds, abort
                 if time.time() - state_timer > 4.0:
-                     progress("LOST QR. FORCING LAND.")
-                     mission_state = STATE_LANDING
+                      progress("LOST QR. ABORTING TO RETURN.")
+                      mission_state = STATE_PREPARE_RETURN
+
+        # --- NEW RETURN LOGIC ---
+        elif mission_state == STATE_PREPARE_RETURN:
+            # 1. Climb slightly
+            if web_data["alt"] < 0.4:
+                progress("CLIMBING FOR RETURN...")
+                time.sleep(0.5)
+                continue
+
+            # 2. Yaw North
+            progress("YAWING TO NORTH...")
+            dur = perform_rotation(180, 1) 
+            time.sleep(dur)
+            navigator.current_heading = DIR_N # Reset state heading
+
+            # 3. Set Target
+            progress("SETTING TARGET: ToSouth")
+            navigator.target_node = "ToSouth"
+            
+            # 4. Resume Navigation
+            mission_state = STATE_CALCULATING
 
         elif mission_state == STATE_PUSH_OUT:
             if time.time() - state_timer > CONFIG["flight"]["blind_fwd_time"]:
@@ -1147,122 +990,13 @@ def mission_logic_thread():
                     mission_state = STATE_AT_NODE
                     state_timer = time.time()
 
+        elif mission_state == STATE_AT_NODE:
+            if time.time() - state_timer > 2.0:
+                mission_state = STATE_CALCULATING
+
         elif mission_state == STATE_LANDING:
             set_mode("LAND"); time.sleep(1)
             if not web_data["armed"]: mission_start_command = False; mission_state = STATE_WAIT_USER; progress("LANDED")
-
-# ==========================================
-# 6. FLASK & API
-# ==========================================
-def get_display_frame():
-    while True:
-        with frame_lock:
-            if global_frame is None:
-                img = np.zeros((240, 320, 3), dtype=np.uint8)
-                cv2.putText(img, "NO BOTTOM CAM", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-                encoded = cv2.imencode('.jpg', img)[1].tobytes()
-            else:
-                encoded = cv2.imencode('.jpg', global_frame)[1].tobytes()
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
-        time.sleep(0.1)
-
-# NEW: Generator for Front Camera
-def get_front_display_frame():
-    while True:
-        with front_frame_lock:
-            if global_front_frame is None:
-                img = np.zeros((240, 320, 3), dtype=np.uint8)
-                cv2.putText(img, "NO FRONT CAM", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-                encoded = cv2.imencode('.jpg', img)[1].tobytes()
-            else:
-                encoded = cv2.imencode('.jpg', global_front_frame)[1].tobytes()
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
-        time.sleep(0.1)
-
-@app.route('/status')
-def status(): return jsonify(web_data)
-
-@app.route('/set_target', methods=['POST'])
-def set_target_api():
-    t = request.json.get("target")
-    if navigator.set_target(t): return jsonify({"status": "ok", "msg": f"Target: {t}"})
-    return jsonify({"status": "error", "msg": "Invalid QR Code"})
-
-@app.route('/start_mission')
-def start_cmd():
-    global mission_start_command
-    mission_start_command = True; return jsonify({"status": "ok"})
-
-@app.route('/stop_mission')
-def stop_cmd(): global mission_state; mission_state = STATE_LANDING; return jsonify({"status": "ok"})
-
-@app.route('/')
-def index():
-    return render_template_string('''
-    <!DOCTYPE html><html><head><title>KING PHOENIX V41</title>
-    <style>body{background:#111;color:#0f0;font-family:monospace;padding:20px}
-    .btn{padding:10px 20px;background:#333;color:#fff;border:1px solid #0f0;cursor:pointer;margin:5px}
-    .grid-btn{width:80px;height:60px;margin:5px}
-    .cam-container{display:flex; flex-wrap:wrap;}
-    .cam-box{margin-right:10px; border:2px solid #0f0;}
-    </style></head><body>
-    <h1>KING PHOENIX V41: OBSTACLE EDITION</h1>
-    
-    <div class="cam-container">
-        <div class="cam-box">
-            <div style="background:#000;color:#fff;padding:2px">BOTTOM CAM (LINE/QR)</div>
-            <img src="/video_feed" width="320">
-        </div>
-        <div class="cam-box">
-            <div style="background:#000;color:#fff;padding:2px">FRONT CAM (GATES)</div>
-            <img src="/video_feed_front" width="320">
-        </div>
-    </div>
-
-    <h3>STATUS: <span id="st">INIT</span> | MSG: <span id="msg">-</span></h3>
-    <h3>CURRENT: <span id="cur">-</span> | TARGET: <span id="tgt">-</span></h3>
-    <h3>ALT: <span id="alt">0.0</span>m</h3>
-    
-    <div>
-        <button class="btn" onclick="fetch('/start_mission')">START</button>
-        <button class="btn" style="border-color:red" onclick="fetch('/stop_mission')">LAND</button>
-    </div>
-    <br>
-    <div>
-        <b>SELECT TARGET:</b><br>
-        <button class="btn grid-btn" onclick="st('S,W,N,W,1')">Kiri Atas</button>
-        <button class="btn grid-btn" onclick="st('ToNorth')">Tengah Atas</button>
-        <button class="btn grid-btn" onclick="st('ToEast')">Kanan Atas</button><br>
-        <button class="btn grid-btn" onclick="st('ToWest')">Kiri Bawah</button>
-        <button class="btn grid-btn" onclick="st('N,S,W,S,3')">Tengah Bawah</button>
-        <button class="btn grid-btn" onclick="st('ToSouth')">Kanan Bawah</button>
-    </div>
-
-    <script>
-    function st(t){
-        fetch('/set_target', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target:t})})
-    }
-    setInterval(()=>{
-        fetch('/status').then(r=>r.json()).then(d=>{
-            document.getElementById('st').innerText=d.mode;
-            document.getElementById('msg').innerText=d.msg;
-            document.getElementById('cur').innerText=d.curr;
-            document.getElementById('tgt').innerText=d.target;
-            document.getElementById('alt').innerText=d.alt.toFixed(2);
-        });
-    }, 500);
-    </script>
-    </body></html>
-    ''')
-
-@app.route('/video_feed')
-def video_feed(): return Response(get_display_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# ROUTE FOR FRONT CAMERA
-@app.route('/video_feed_front')
-def video_feed_front(): return Response(get_front_display_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-def run_flask(): app.run(host='0.0.0.0', port=CONFIG["system"]["http_port"], threaded=True)
 
 # ==========================================
 # 7. MAIN STARTUP
@@ -1290,7 +1024,6 @@ threading.Thread(target=vision_thread_func, daemon=True).start()
 threading.Thread(target=front_camera_thread, daemon=True).start()
 threading.Thread(target=mission_logic_thread, daemon=True).start()
 
-
 progress("SYSTEM READY. CALIBRATE T265...")
 H_aeroRef_T265Ref = np.array([[0,0,-1,0],[1,0,0,0],[0,-1,0,0],[0,0,0,1]])
 H_T265body_aeroBody = np.linalg.inv(H_aeroRef_T265Ref)
@@ -1301,19 +1034,13 @@ try:
         pose = frames.get_pose_frame()
         if pose:
             with mav_lock:
-                # FIX 1: Set time to 0 to bypass TimeSync issues. ArduPilot will use receipt time.
-                current_time_us = 0 
-                
+                current_time_us = int(round(time.time() * 1000000))
                 data = pose.get_pose_data()
                 H_265 = tf.quaternion_matrix([data.rotation.w, data.rotation.x, data.rotation.y, data.rotation.z])
                 H_265[0][3] = data.translation.x * CONFIG["t265"]["scale_factor"]
                 H_265[1][3] = data.translation.y * CONFIG["t265"]["scale_factor"]
                 H_265[2][3] = data.translation.z * CONFIG["t265"]["scale_factor"]
                 H_aeroRef_aeroBody = H_aeroRef_T265Ref.dot(H_265.dot(H_T265body_aeroBody))
-                
-                # FIX 2: Increased reset threshold to 0.5m to stop the EKF from constantly resetting
-                if prev_data and m.sqrt((data.translation.x-prev_data.translation.x)**2) > 0.5: 
-                    reset_counter += 1
-                    
+                if prev_data and m.sqrt((data.translation.x-prev_data.translation.x)**2) > 0.1: reset_counter+=1
                 prev_data = data
 except KeyboardInterrupt: pipe.stop(); mavlink_thread_should_exit=True
