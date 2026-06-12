@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>KING PHOENIX GCS</title>
+        <style>
+            /* ============================================================
+   KING PHOENIX GCS — Mission Control Dashboard
+   ============================================================ */
+            :root {
+                --bg: #0a0e14;
+                --surface: #12171f;
+                --surface2: #181e28;
+                --border: #1e2a3a;
+                --text: #c8d6e5;
+                --muted: #56657a;
+                --green: #10b981;
+                --green-dim: #064e3b;
+                --red: #ef4444;
+                --red-dim: #7f1d1d;
+                --amber: #f59e0b;
+                --amber-dim: #78350f;
+                --blue: #3b82f6;
+                --cyan: #06b6d4;
+                --purple: #8b5cf6;
+                --font:
+                    "SF Mono", "Fira Code", "Cascadia Code", "Consolas",
+                    monospace;
+                --radius: 6px;
+                --transition: 0.2s ease;
+            }
+            *,
+            *::before,
+            *::after {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+
+            body {
+                background: var(--bg);
+                color: var(--text);
+                font-family: var(--font);
+                font-size: 13px;
+                line-height: 1.5;
+                min-height: 100vh;
+                overflow-x: hidden;
+            }
+
+            /* ---- Header bar ---- */
+            .header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 10px 20px;
+                background: var(--surface);
+                border-bottom: 1px solid var(--border);
+                gap: 16px;
+                flex-wrap: wrap;
+            }
+            .header .brand {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                font-size: 1.1rem;
+                font-weight: 700;
+                color: var(--green);
+                letter-spacing: 1px;
+                white-space: nowrap;
+            }
+            .header .brand-logo {
+                height: 44px;
+                width: 44px;
+                flex-shrink: 0;
+                display: block;
+            }
+            .header .brand-logo svg {
+                width: 100%;
+                height: 100%;
+                display: block;
+            }
+            .header .brand span {
+                color: var(--muted);
+                font-weight: 400;
+            }
+            .header .indicators {
+                display: flex;
+                gap: 16px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            .indicator {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 0.85rem;
+                padding: 4px 10px;
+                border-radius: var(--radius);
+                background: var(--surface2);
+                border: 1px solid var(--border);
+                white-space: nowrap;
+            }
+            .indicator .dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--muted);
+            }
+            .indicator .dot.on {
+                background: var(--green);
+                box-shadow: 0 0 6px var(--green);
+            }
+            .indicator .dot.warn {
+                background: var(--amber);
+                box-shadow: 0 0 6px var(--amber);
+            }
+            .indicator .dot.off {
+                background: var(--red);
+                box-shadow: 0 0 6px var(--red);
+            }
+
+            /* ---- Main grid ---- */
+            .main-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                grid-template-rows: auto auto;
+                gap: 12px;
+                padding: 12px;
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+            @media (max-width: 900px) {
+                .main-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            /* ---- Panel ---- */
+            .panel {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                overflow: hidden;
+            }
+            .panel-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 8px 12px;
+                background: var(--surface2);
+                border-bottom: 1px solid var(--border);
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: var(--muted);
+            }
+            .panel-header .tag {
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-size: 0.7rem;
+                font-weight: 600;
+            }
+            .tag-live {
+                background: var(--red-dim);
+                color: var(--red);
+            }
+            .tag-live.active {
+                background: var(--green-dim);
+                color: var(--green);
+            }
+
+            .panel-body {
+                padding: 0;
+                position: relative;
+            }
+            .panel-body img,
+            .panel-body video {
+                display: block;
+                width: 100%;
+                height: auto;
+                background: var(--surface2);
+            }
+            .panel-body img::before {
+                content: "";
+                display: block;
+                padding-bottom: 75%;
+            }
+
+            /* ---- Camera fallback (shown when img breaks) ---- */
+            .cam-wrap {
+                position: relative;
+                width: 100%;
+            }
+            .cam-wrap .fallback {
+                display: none;
+                position: absolute;
+                inset: 0;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                background: var(--surface2);
+                border: 1px dashed var(--border);
+                margin: 8px;
+                border-radius: 4px;
+                gap: 8px;
+                pointer-events: none;
+            }
+            .cam-wrap .fallback .fb-icon {
+                font-size: 2rem;
+                opacity: 0.4;
+            }
+            .cam-wrap .fallback .fb-text {
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                color: var(--muted);
+            }
+            .cam-wrap.broken img {
+                opacity: 0;
+            }
+            .cam-wrap.broken .fallback {
+                display: flex;
+            }
+
+            /* ---- Telemetry cards ---- */
+            .telemetry-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+                padding: 12px;
+            }
+            .telem-card {
+                background: var(--surface2);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 10px 12px;
+            }
+            .telem-card .label {
+                font-size: 0.7rem;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: var(--muted);
+                margin-bottom: 4px;
+            }
+            .telem-card .value {
+                font-size: 1.3rem;
+                font-weight: 700;
+            }
+            .telem-card .sub {
+                font-size: 0.75rem;
+                color: var(--muted);
+                margin-top: 2px;
+            }
+            .val-green {
+                color: var(--green);
+            }
+            .val-amber {
+                color: var(--amber);
+            }
+            .val-red {
+                color: var(--red);
+            }
+            .val-cyan {
+                color: var(--cyan);
+            }
+
+            /* ---- Mission state badge ---- */
+            .state-badge {
+                display: inline-block;
+                padding: 6px 16px;
+                border-radius: var(--radius);
+                font-weight: 700;
+                font-size: 0.9rem;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .state-idle {
+                background: var(--surface2);
+                color: var(--muted);
+                border: 1px solid var(--border);
+            }
+            .state-active {
+                background: var(--green-dim);
+                color: var(--green);
+                border: 1px solid var(--green);
+            }
+            .state-warning {
+                background: var(--amber-dim);
+                color: var(--amber);
+                border: 1px solid var(--amber);
+            }
+            .state-danger {
+                background: var(--red-dim);
+                color: var(--red);
+                border: 1px solid var(--red);
+            }
+
+            /* ---- Altitude bar ---- */
+            .alt-bar-wrap {
+                height: 8px;
+                background: var(--surface2);
+                border-radius: 4px;
+                margin-top: 6px;
+                overflow: hidden;
+            }
+            .alt-bar-fill {
+                height: 100%;
+                border-radius: 4px;
+                background: linear-gradient(90deg, var(--cyan), var(--green));
+                transition: width 0.5s ease;
+            }
+
+            /* ---- Grid map ---- */
+            .grid-map {
+                display: grid;
+                grid-template-columns: repeat(5, 1fr);
+                grid-template-rows: repeat(3, 1fr);
+                gap: 3px;
+                padding: 12px;
+                aspect-ratio: 5/3;
+                max-height: 200px;
+            }
+            .grid-cell {
+                border: 1px solid var(--border);
+                border-radius: 3px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.6rem;
+                color: var(--muted);
+                background: var(--surface2);
+                cursor: pointer;
+                transition: all var(--transition);
+                position: relative;
+                padding: 2px;
+                text-align: center;
+                word-break: break-all;
+            }
+            .grid-cell:hover {
+                border-color: var(--blue);
+                color: var(--text);
+            }
+            .grid-cell.current {
+                border-color: var(--cyan);
+                background: rgba(6, 182, 212, 0.15);
+                color: var(--cyan);
+                font-weight: 700;
+            }
+            .grid-cell.target {
+                border-color: var(--amber);
+                background: rgba(245, 158, 11, 0.15);
+                color: var(--amber);
+                font-weight: 700;
+            }
+            .grid-cell.current.target {
+                border-color: var(--green);
+                background: rgba(16, 185, 129, 0.2);
+                color: var(--green);
+            }
+
+            /* ---- Buttons ---- */
+            .btn-row {
+                display: flex;
+                gap: 8px;
+                padding: 12px;
+            }
+            .btn {
+                flex: 1;
+                padding: 12px 16px;
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                background: var(--surface2);
+                color: var(--text);
+                font-family: var(--font);
+                font-size: 0.85rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                cursor: pointer;
+                transition: all var(--transition);
+                text-align: center;
+            }
+            .btn:hover {
+                filter: brightness(1.2);
+            }
+            .btn-start {
+                border-color: var(--green);
+                color: var(--green);
+                background: var(--green-dim);
+            }
+            .btn-start:hover {
+                background: var(--green);
+                color: #000;
+            }
+            .btn-land {
+                border-color: var(--red);
+                color: var(--red);
+                background: var(--red-dim);
+            }
+            .btn-land:hover {
+                background: var(--red);
+                color: #fff;
+            }
+
+            /* ---- Status log ---- */
+            .log-panel {
+                grid-column: 1 / -1;
+            }
+            .log-area {
+                max-height: 120px;
+                overflow-y: auto;
+                padding: 8px 12px;
+                font-size: 0.8rem;
+                color: var(--muted);
+            }
+            .log-area .entry {
+                padding: 2px 0;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                gap: 10px;
+            }
+            .log-area .time-stamp {
+                color: var(--muted);
+                white-space: nowrap;
+            }
+            .log-area .msg-text {
+                color: var(--text);
+            }
+
+            /* ---- Victim list ---- */
+            .victim-list {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 4px;
+                padding: 0 12px 12px;
+            }
+            .victim-tag {
+                padding: 3px 8px;
+                border-radius: 3px;
+                background: var(--purple);
+                color: #fff;
+                font-size: 0.7rem;
+                font-weight: 600;
+            }
+
+            /* ---- Gate indicator ---- */
+            .gate-indicator {
+                padding: 8px 12px;
+                font-size: 0.8rem;
+                font-weight: 600;
+                text-align: center;
+            }
+            .gate-none {
+                color: var(--muted);
+            }
+            .gate-red {
+                color: var(--red);
+                background: var(--red-dim);
+            }
+            .gate-yellow {
+                color: var(--amber);
+                background: var(--amber-dim);
+            }
+
+            /* ---- Compass ---- */
+            .compass {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.85rem;
+                gap: 4px;
+                padding: 4px 0;
+                color: var(--muted);
+            }
+            .compass .dir {
+                color: var(--cyan);
+                font-weight: 700;
+            }
+        </style>
+    </head>
+    <body>
+        <!-- ========== HEADER ========== -->
+        <div class="header">
+            <div class="brand">
+                <span class="brand-logo">
+                    <svg
+                        viewBox="60 60 145 145"
+                        xmlns="http://www.w3.org/2000/svg"
+                    >
+                        <circle
+                            fill="none"
+                            stroke="#10b981"
+                            stroke-width="4"
+                            cx="132.29"
+                            cy="132.29"
+                            r="66.146"
+                        />
+                        <circle
+                            fill="none"
+                            stroke="#10b981"
+                            stroke-width="3"
+                            cx="132.29"
+                            cy="132.29"
+                            r="46.302"
+                        />
+                        <g transform="translate(-0.024,0.077)">
+                            <path
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="2.7"
+                                d="M 178.53,132.83 C 184.61,116.70 183.36,100.67 173.59,90.90 158.09,75.40 126.96,81.50 104.23,104.23 81.50,126.96 75.64,157.95 91.14,173.45 98.18,180.50 108.43,183.13 119.64,181.77 M 86.05,132.52 C 79.96,116.39 81.36,100.90 91.13,91.13 106.63,75.63 137.62,81.50 160.35,104.23 183.09,126.96 188.95,157.95 173.45,173.45 167.19,179.71 158.41,182.48 148.67,182.07"
+                            />
+                            <circle
+                                fill="#10b981"
+                                cx="90.355"
+                                cy="92.439"
+                                r="3.969"
+                            />
+                            <path
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="1.5"
+                                d="M 174.31,92.09 C 172.65,89.96 170.40,88.29 168.66,86.69 166.84,85.34 164.96,83.68 163.22,82.98 159.78,81.58 155.86,80.99 152.35,80.24 150.95,79.94 144.61,80.38 144.61,80.38"
+                                marker-start="url(#da)"
+                            />
+                        </g>
+                        <g transform="translate(0.014,-0.166)">
+                            <circle
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.5"
+                                cx="116.56"
+                                cy="148.31"
+                                r="10.583"
+                            />
+                            <circle
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.5"
+                                cx="147.99"
+                                cy="148.31"
+                                r="10.583"
+                            />
+                            <circle
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.5"
+                                cx="147.99"
+                                cy="116.60"
+                                r="10.583"
+                            />
+                            <circle
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.5"
+                                cx="116.56"
+                                cy="116.60"
+                                r="10.583"
+                            />
+                            <path
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.706"
+                                d="M 148.13,116.37 C 144.04,112.29 142.58,114.26 140.47,116.37 L 132.29,124.55 124.07,116.33 C 121.96,114.22 120.49,112.26 116.41,116.33 L 116.15,116.60 C 112.07,120.68 114.04,122.14 116.15,124.25 L 124.37,132.47 116.22,140.62 C 114.11,142.73 112.14,144.19 116.22,148.28 L 116.49,148.54 C 120.56,152.61 122.03,150.65 124.14,148.54 L 132.30,140.38 140.49,148.58 C 142.60,150.69 144.06,152.66 148.15,148.58 L 148.41,148.31 C 152.48,144.24 150.52,142.77 148.41,140.66 L 140.21,132.46 148.39,124.29 C 150.50,122.18 152.46,120.71 148.39,116.63 L 148.13,116.37 Z"
+                            />
+                            <circle
+                                fill="none"
+                                stroke="#10b981"
+                                stroke-width="0.994"
+                                cx="132.28"
+                                cy="132.46"
+                                r="7.888"
+                            />
+                            <circle
+                                fill="#10b981"
+                                cx="116.56"
+                                cy="116.60"
+                                r="2.646"
+                            />
+                            <circle
+                                fill="#10b981"
+                                cx="147.99"
+                                cy="116.60"
+                                r="2.646"
+                            />
+                            <circle
+                                fill="#10b981"
+                                cx="147.99"
+                                cy="148.31"
+                                r="2.646"
+                            />
+                            <circle
+                                fill="#10b981"
+                                cx="116.56"
+                                cy="148.31"
+                                r="2.646"
+                            />
+                        </g>
+                        <defs>
+                            <marker
+                                id="da"
+                                viewBox="0 0 1 1"
+                                refX="0"
+                                refY="0"
+                                orient="auto"
+                            >
+                                <path
+                                    fill="#10b981"
+                                    d="M 0,0 5,-5 -12.5,0 5,5 Z"
+                                    transform="scale(-0.5)"
+                                />
+                            </marker>
+                        </defs>
+                    </svg>
+                </span>
+                KING PHOENIX <span>GCS v2</span>
+            </div>
+            <div class="indicators">
+                <div class="indicator" id="ind-armed">
+                    <span class="dot off" id="dot-armed"></span>
+                    <span id="txt-armed">DISARMED</span>
+                </div>
+                <div class="indicator">
+                    <span>🔋</span> <span id="txt-bat">--</span>V
+                </div>
+                <div class="indicator">
+                    <span>🧭</span> <span id="txt-heading">--</span>°
+                </div>
+                <div class="indicator">
+                    <span>✈</span> <span id="txt-mode">--</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== MAIN GRID ========== -->
+        <div class="main-grid">
+            <!-- Bottom camera -->
+            <div class="panel">
+                <div class="panel-header">
+                    BOTTOM CAMERA — LINE / QR
+                    <span class="tag tag-live" id="tag-bottom">STANDBY</span>
+                </div>
+                <div class="panel-body">
+                    <div class="cam-wrap" id="cam-wrap-bottom">
+                        <img
+                            src="/video_feed"
+                            alt="Bottom cam"
+                            onerror="this.parentElement.classList.add('broken')"
+                        />
+                        <div class="fallback">
+                            <span class="fb-text">Not Connected</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Front camera -->
+            <div class="panel">
+                <div class="panel-header">
+                    FRONT CAMERA — GATES / VICTIMS
+                    <span class="tag tag-live" id="tag-front">STANDBY</span>
+                </div>
+                <div class="panel-body">
+                    <div class="cam-wrap" id="cam-wrap-front">
+                        <img
+                            src="/video_feed_front"
+                            alt="Front cam"
+                            onerror="this.parentElement.classList.add('broken')"
+                        />
+                        <div class="fallback">
+                            <span class="fb-text">Not Connected</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Telemetry panel -->
+            <div class="panel">
+                <div class="panel-header">TELEMETRY</div>
+                <div class="panel-body">
+                    <!-- State + altitude -->
+                    <div style="padding: 12px">
+                        <div
+                            style="
+                                display: flex;
+                                align-items: center;
+                                justify-content: space-between;
+                                margin-bottom: 10px;
+                            "
+                        >
+                            <span
+                                style="
+                                    font-size: 0.75rem;
+                                    text-transform: uppercase;
+                                    letter-spacing: 1px;
+                                    color: var(--muted);
+                                "
+                                >Mission State</span
+                            >
+                            <span
+                                class="state-badge state-idle"
+                                id="state-badge"
+                                >INIT</span
+                            >
+                        </div>
+                        <div class="telem-card" style="margin-bottom: 8px">
+                            <div class="label">Altitude</div>
+                            <div class="value val-cyan" id="val-alt">
+                                0.00<span style="font-size: 0.7rem"> m</span>
+                            </div>
+                            <div class="alt-bar-wrap">
+                                <div
+                                    class="alt-bar-fill"
+                                    id="alt-bar"
+                                    style="width: 0%"
+                                ></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="telemetry-grid">
+                        <div class="telem-card">
+                            <div class="label">Line Status</div>
+                            <div class="value" id="val-line">---</div>
+                        </div>
+                        <div class="telem-card">
+                            <div class="label">Error X</div>
+                            <div class="value" id="val-errx">
+                                --<span style="font-size: 0.7rem"> px</span>
+                            </div>
+                        </div>
+                        <div class="telem-card">
+                            <div class="label">Line Angle</div>
+                            <div class="value" id="val-angle">
+                                --<span style="font-size: 0.7rem">°</span>
+                            </div>
+                        </div>
+                        <div class="telem-card">
+                            <div class="label">Gate Request</div>
+                            <div class="value" id="val-gate">
+                                --<span style="font-size: 0.7rem"> m</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Gate status bar -->
+                    <div class="gate-indicator gate-none" id="gate-bar">
+                        NO GATE DETECTED
+                    </div>
+
+                    <!-- Victims -->
+                    <div
+                        style="
+                            font-size: 0.7rem;
+                            text-transform: uppercase;
+                            letter-spacing: 1px;
+                            color: var(--muted);
+                            padding: 0 12px 4px;
+                        "
+                    >
+                        Victims Found: <span id="victim-count">0</span>
+                    </div>
+                    <div class="victim-list" id="victim-list"></div>
+                </div>
+            </div>
+
+            <!-- Navigation panel -->
+            <div class="panel">
+                <div class="panel-header">
+                    NAVIGATION
+                    <span style="color: var(--muted); font-size: 0.7rem">
+                        <span id="nav-curr">?</span> →
+                        <span id="nav-tgt">?</span>
+                    </span>
+                </div>
+                <div class="panel-body">
+                    <!-- Grid map -->
+                    <div class="grid-map" id="grid-map">
+                        <!-- Populated by JS -->
+                    </div>
+                    <!-- Buttons -->
+                    <div class="btn-row">
+                        <button
+                            class="btn btn-start"
+                            onclick="fetch('/start_mission')"
+                            id="btn-start"
+                        >
+                            ▶ START MISSION
+                        </button>
+                        <button
+                            class="btn btn-land"
+                            onclick="fetch('/stop_mission')"
+                        >
+                            ■ LAND NOW
+                        </button>
+                    </div>
+                    <!-- Compass -->
+                    <div class="compass">
+                        Heading: <span class="dir" id="compass-dir">---</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status log -->
+            <div class="panel log-panel">
+                <div class="panel-header">MISSION LOG</div>
+                <div class="log-area" id="log-area">
+                    <div class="entry">
+                        <span class="time-stamp">--:--:--</span
+                        ><span class="msg-text">Waiting for telemetry...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== SCRIPTS ========== -->
+        <script>
+            // ---- Grid definition ----
+            const GRID_MAP = {
+                "S,W,N,W,1": [0, 2],
+                ToNorth: [2, 2],
+                ToEast: [4, 2],
+                ToWest: [0, 0],
+                "N,S,W,S,3": [2, 0],
+                BUILDING: [3, 0],
+                ToSouth: [4, 0],
+            };
+            const GRID_LABELS = {};
+            for (const [k, v] of Object.entries(GRID_MAP)) {
+                const short = k.length > 8 ? k.slice(0, 6) + "…" : k;
+                GRID_LABELS[`${v[0]},${v[1]}`] = { key: k, short };
+            }
+
+            // ---- Build grid map ----
+            const gridEl = document.getElementById("grid-map");
+            for (let y = 2; y >= 0; y--) {
+                for (let x = 0; x <= 4; x++) {
+                    const cell = document.createElement("div");
+                    cell.className = "grid-cell";
+                    cell.dataset.x = x;
+                    cell.dataset.y = y;
+                    const info = GRID_LABELS[`${x},${y}`];
+                    cell.textContent = info ? info.short : `${x},${y}`;
+                    if (info) {
+                        cell.title = info.key;
+                        cell.style.cursor = "pointer";
+                        cell.onclick = () => {
+                            fetch("/set_target", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ target: info.key }),
+                            });
+                        };
+                    }
+                    gridEl.appendChild(cell);
+                }
+            }
+
+            // ---- Logging ----
+            const logArea = document.getElementById("log-area");
+            let lastMsg = "";
+            function addLog(msg) {
+                if (msg === lastMsg) return;
+                lastMsg = msg;
+                const now = new Date();
+                const ts = now.toTimeString().slice(0, 8);
+                const entry = document.createElement("div");
+                entry.className = "entry";
+                entry.innerHTML = `<span class="time-stamp">${ts}</span><span class="msg-text">${msg}</span>`;
+                logArea.prepend(entry);
+                if (logArea.children.length > 50) logArea.lastChild.remove();
+            }
+
+            // ---- State classification ----
+            const ACTIVE_STATES = [
+                "TAKEOFF",
+                "INITIAL_SCAN",
+                "CALCULATING",
+                "TURNING",
+                "PUSH_OUT",
+                "FOLLOW_LINE",
+                "AT_NODE",
+                "BUILDING_ASCEND",
+                "BUILDING_SCAN_HOVER",
+                "BUILDING_CREATE_GAP",
+                "BUILDING_ALIGN_CENTER",
+                "BUILDING_TURN",
+                "BUILDING_DESCEND",
+                "BUILDING_RECOVER",
+                "ALIGN_NORTH",
+                "CENTERING",
+            ];
+            const WARN_STATES = ["WAIT_USER", "INIT", "SCANNING"];
+            const DANGER_STATES = ["LANDING"];
+
+            function stateClass(s) {
+                if (ACTIVE_STATES.includes(s)) return "state-active";
+                if (WARN_STATES.includes(s)) return "state-warning";
+                if (DANGER_STATES.includes(s)) return "state-danger";
+                return "state-idle";
+            }
+
+            // ---- Main poll loop ----
+            let prevState = "";
+            function poll() {
+                fetch("/status")
+                    .then((r) => r.json())
+                    .then((d) => {
+                        // Header indicators
+                        const dot = document.getElementById("dot-armed");
+                        const txt = document.getElementById("txt-armed");
+                        if (d.armed) {
+                            dot.className = "dot on";
+                            txt.textContent = "ARMED";
+                        } else {
+                            dot.className = "dot off";
+                            txt.textContent = "DISARMED";
+                        }
+                        document.getElementById("txt-bat").textContent =
+                            d.battery > 0 ? d.battery.toFixed(1) : "--";
+                        document.getElementById("txt-heading").textContent =
+                            d.heading > 0 ? d.heading.toFixed(0) : "--";
+                        document.getElementById("txt-mode").textContent =
+                            d.flight_mode || "--";
+
+                        // State badge
+                        const badge = document.getElementById("state-badge");
+                        badge.textContent = d.mode;
+                        badge.className = "state-badge " + stateClass(d.mode);
+                        if (d.mode !== prevState) {
+                            addLog(`State: ${d.mode}`);
+                            prevState = d.mode;
+                        }
+
+                        // Altitude
+                        document.getElementById("val-alt").innerHTML =
+                            d.alt.toFixed(2) +
+                            '<span style="font-size:0.7rem;"> m</span>';
+                        const altPct = Math.min(100, (d.alt / 2.0) * 100);
+                        document.getElementById("alt-bar").style.width =
+                            altPct + "%";
+
+                        // Line
+                        const lineEl = document.getElementById("val-line");
+                        if (d.line_detected) {
+                            lineEl.textContent = "LOCKED";
+                            lineEl.className = "value val-green";
+                        } else {
+                            lineEl.textContent = "SEARCHING";
+                            lineEl.className = "value val-red";
+                        }
+                        document.getElementById("val-errx").innerHTML =
+                            d.error_x.toFixed(1) +
+                            '<span style="font-size:0.7rem;"> px</span>';
+                        document.getElementById("val-angle").innerHTML =
+                            d.line_angle.toFixed(1) +
+                            '<span style="font-size:0.7rem;">°</span>';
+
+                        // Gate
+                        const gateEl = document.getElementById("val-gate");
+                        const gateBar = document.getElementById("gate-bar");
+                        if (d.gate_alt !== null && d.gate_alt !== undefined) {
+                            gateEl.innerHTML =
+                                d.gate_alt.toFixed(1) +
+                                '<span style="font-size:0.7rem;"> m</span>';
+                            if (d.gate_alt > 1.0) {
+                                gateBar.textContent =
+                                    "🔴 RED GATE — CLIMBING TO " +
+                                    d.gate_alt.toFixed(1) +
+                                    "m";
+                                gateBar.className = "gate-indicator gate-red";
+                            } else {
+                                gateBar.textContent =
+                                    "🟡 YELLOW GATE — HOLDING AT " +
+                                    d.gate_alt.toFixed(1) +
+                                    "m";
+                                gateBar.className =
+                                    "gate-indicator gate-yellow";
+                            }
+                        } else {
+                            gateEl.innerHTML =
+                                '--<span style="font-size:0.7rem;"> m</span>';
+                            gateBar.textContent = "NO GATE DETECTED";
+                            gateBar.className = "gate-indicator gate-none";
+                        }
+
+                        // Victims
+                        const vc = d.victims ? d.victims.length : 0;
+                        document.getElementById("victim-count").textContent =
+                            vc;
+                        const vList = document.getElementById("victim-list");
+                        vList.innerHTML = (d.victims || [])
+                            .map(
+                                (v) =>
+                                    '<span class="victim-tag">' + v + "</span>",
+                            )
+                            .join("");
+
+                        // Camera tags & fallback
+                        const wB = document.getElementById("cam-wrap-bottom");
+                        const wF = document.getElementById("cam-wrap-front");
+                        wB.classList.toggle("broken", !d.bottom_cam);
+                        wF.classList.toggle("broken", !d.front_cam);
+                        document.getElementById("tag-bottom").textContent =
+                            d.line_detected
+                                ? "LIVE"
+                                : d.bottom_cam
+                                  ? "STANDBY"
+                                  : "OFFLINE";
+                        document.getElementById("tag-bottom").className =
+                            "tag tag-live" + (d.line_detected ? " active" : "");
+                        document.getElementById("tag-front").textContent =
+                            d.wall_qr
+                                ? "LOCKED"
+                                : d.front_cam
+                                  ? "STANDBY"
+                                  : "OFFLINE";
+                        document.getElementById("tag-front").className =
+                            "tag tag-live" + (d.wall_qr ? " active" : "");
+
+                        // Navigation
+                        document.getElementById("nav-curr").textContent =
+                            d.curr || "?";
+                        document.getElementById("nav-tgt").textContent =
+                            d.target || "?";
+
+                        // Compass
+                        const h = d.heading || 0;
+                        const dirs = [
+                            "N",
+                            "NE",
+                            "E",
+                            "SE",
+                            "S",
+                            "SW",
+                            "W",
+                            "NW",
+                        ];
+                        const dir = dirs[Math.round(h / 45) % 8];
+                        document.getElementById("compass-dir").textContent =
+                            `${h.toFixed(0)}° ${dir}`;
+
+                        // Grid cells
+                        const cells = gridEl.querySelectorAll(".grid-cell");
+                        cells.forEach((c) => {
+                            c.classList.remove("current", "target");
+                            const cx = parseInt(c.dataset.x),
+                                cy = parseInt(c.dataset.y);
+                            const info = GRID_LABELS[`${cx},${cy}`];
+                            if (!info) return;
+                            if (info.key === d.curr) c.classList.add("current");
+                            if (info.key === d.target)
+                                c.classList.add("target");
+                        });
+
+                        // Log message changes
+                        if (d.msg && d.msg !== lastMsg) addLog(d.msg);
+                    })
+                    .catch(() => {}); // silent fail on network hiccup
+            }
+
+            setInterval(poll, 500);
+            poll();
+        </script>
+    </body>
+</html>

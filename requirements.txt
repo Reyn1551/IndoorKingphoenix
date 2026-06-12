@@ -1,0 +1,14 @@
+# Core
+flask>=3.0
+opencv-python>=4.8
+numpy>=1.24
+
+# Vision (QR decoding)
+pyzbar>=0.1.9
+
+# Drone communication
+pymavlink>=2.4
+
+# Intel RealSense T265 (optional — uncomment if hardware is connected)
+# pyrealsense2>=2.54
+# transformations>=2023.1
