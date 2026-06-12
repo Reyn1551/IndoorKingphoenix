@@ -15,7 +15,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import sys
 
 import cv2
 
@@ -69,8 +68,8 @@ def check_cameras(
     print("   CAMERA INDEX CHECKER")
     print("=" * 50)
     print(f"   Range: {start} – {end}")
-    print(f"   Press  [n]  next camera")
-    print(f"   Press  [q]  quit")
+    print("   Press  [n]  next camera")
+    print("   Press  [q]  quit")
     print("=" * 50)
 
     for idx in range(start, end + 1):

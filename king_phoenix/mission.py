@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Set
 
 from king_phoenix.navigator import DIR_E, DIR_N, DIR_S, DIR_W, GRID_MAP
 

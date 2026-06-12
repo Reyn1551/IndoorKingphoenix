@@ -82,6 +82,11 @@ def hsv_tuner(cam_index: int, width: int, height: int) -> None:
     print("\nAdjust sliders until the object is white and background is black.")
     print("Press  [q]  to quit.\n")
 
+    # Initialise so they're always bound even if the loop breaks early
+    lower = np.array([0, 0, 0], dtype=np.uint8)
+    upper = np.array([179, 255, 255], dtype=np.uint8)
+    max_area = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
