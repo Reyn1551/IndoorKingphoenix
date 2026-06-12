@@ -19,24 +19,9 @@ import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as decode_qr
 
+from king_phoenix.vision import _make_placeholder
+
 logger = logging.getLogger(__name__)
-
-
-def _make_placeholder(text: str, size: tuple = (320, 240)) -> bytes:
-    """Generate a dark placeholder JPEG with centred text."""
-    img = np.zeros((size[1], size[0], 3), dtype=np.uint8)
-    img[:] = (18, 23, 31)
-    cv2.rectangle(img, (0, 0), (size[0] - 1, size[1] - 1), (30, 42, 58), 2)
-    lines = text.split("\n")
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    for i, line in enumerate(lines):
-        (tw, th), _ = cv2.getTextSize(line, font, 0.55, 2)
-        x = (size[0] - tw) // 2
-        y = size[1] // 2 - (len(lines) - 1) * 12 + i * 24
-        cv2.putText(img, line, (x, y), font, 0.55, (86, 101, 122), 2, cv2.LINE_AA)
-    for i in range(0, size[0] + size[1], 20):
-        cv2.line(img, (i, 0), (i - size[1], size[1]), (22, 28, 38), 1)
-    return cv2.imencode(".jpg", img)[1].tobytes()
 
 
 class FrontCamera:

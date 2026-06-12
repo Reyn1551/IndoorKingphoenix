@@ -28,13 +28,6 @@ DIR_E: Dir = (1, 0)
 DIR_S: Dir = (0, -1)
 DIR_W: Dir = (-1, 0)
 
-_DIR_NAMES: Dict[Dir, str] = {
-    DIR_N: "NORTH",
-    DIR_E: "EAST",
-    DIR_S: "SOUTH",
-    DIR_W: "WEST",
-}
-
 # QR text → (x, y) coordinates on the 5×3 grid
 GRID_MAP: Dict[str, Tuple[int, int]] = {
     "S,W,N,W,1": (0, 2),

@@ -75,6 +75,10 @@ class T265Handler:
         self._running: bool = False
         self._thread: threading.Thread | None = None
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
     def start(self) -> bool:
         """Launch the T265 pipeline and background thread.
 

@@ -50,8 +50,10 @@ def main() -> None:
     mission = MissionController(cfg, drone, bottom, front, t265, nav)
 
     # --- Cameras ---
-    bottom.start()
-    front.start()
+    if not bottom.start():
+        logger.warning("Bottom camera unavailable — GCS will show placeholder.")
+    if not front.start():
+        logger.warning("Front camera unavailable — GCS will show placeholder.")
 
     # --- Background mission thread ---
     mission_thread = threading.Thread(target=mission.run, daemon=True)

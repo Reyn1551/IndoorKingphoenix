@@ -58,20 +58,21 @@ class BottomVision:
         self.line_angle_error: float = 0.0
 
         # --- QR state ---
-        self.last_qr_data: str = ""
         self.detected_qr_buffer: Optional[str] = None
         self.current_qr_center: Optional[Tuple[float, float]] = None
         self.target_qr_center: Optional[Tuple[float, float]] = None
         self.target_qr_angle: float = 0.0
         self.last_line_time: float = 0.0
 
+        # --- Velocity commands (written by mission, read by send loop) ---
+        self._current_vx: float = 0.0
+        self._current_vy: float = 0.0
+
         # --- Display frame (for Flask) ---
         self.display_frame: Optional[np.ndarray] = None
 
-        # --- Internal state for PID in mission thread ---
+        # --- Internal state ---
         self.last_known_direction: int = 0
-        self.prev_error: float = 0.0
-        self.integral_error: float = 0.0
         self._smooth_error_x: float = 0.0
         self._smooth_angle: float = 0.0
         self._alpha: float = 0.35  # EMA smoothing factor
@@ -133,6 +134,7 @@ class BottomVision:
             min_area: float = vis["min_area"]
             min_ar: float = vis["min_aspect_ratio"]
             cx_offset: int = vis.get("camera_offset_x", 0)
+            ctr_weight: float = vis.get("center_priority_weight", 10.0)
 
             cx_screen = w // 2 + cx_offset
             cut_y = int(h * roi_ratio)
@@ -163,7 +165,7 @@ class BottomVision:
                     continue
                 cx_cnt = int(M["m10"] / M["m00"])
                 dist = abs(cx_cnt - cx_screen)
-                score = area - (dist * 10)
+                score = area - (dist * ctr_weight)
                 if score > best_score:
                     best_score = score
                     best_cnt = cnt

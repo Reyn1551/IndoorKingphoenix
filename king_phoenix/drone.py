@@ -11,14 +11,10 @@ import logging
 import math
 import threading
 import time
-from typing import Optional
 
 from pymavlink import mavutil
 
 logger = logging.getLogger(__name__)
-
-# MAVLink type mask: ignore position, use velocity + yaw-rate
-_VELOCITY_TYPE_MASK: int = 0b0000101111000111
 
 
 class DroneController:
@@ -41,11 +37,8 @@ class DroneController:
         self.battery: float = 0.0  # volts
         self.heading: float = 0.0  # degrees
 
-        # --- PID controller state ---
-        self._prev_error: float = 0.0
-        self._integral_error: float = 0.0
-        self.last_valid_direction: int = 0  # -1 = left, +1 = right
-        self._last_pid_time: Optional[float] = None
+        # --- Yaw-rate state (set by perform_rotation, read by mission) ---
+        self._commanded_yaw_rate: float = 0.0
 
         self._lock = threading.Lock()
 
@@ -167,44 +160,6 @@ class DroneController:
         )
         logger.info("Takeoff sent — target %.1f m.", alt)
 
-    def send_velocity(
-        self, vx: float, vy: float, vz: float = 0.0, yaw_rate: float = 0.0
-    ) -> None:
-        """Send velocity setpoints in the body (FRD) frame.
-
-        Parameters
-        ----------
-        vx : float
-            Forward velocity (m/s).
-        vy : float
-            Lateral velocity (m/s, positive = right).
-        vz : float
-            Vertical velocity (m/s, positive = down). Keep ``0`` for
-            altitude hold.
-        yaw_rate : float
-            Yaw rate (rad/s).
-        """
-        if self.conn is None:
-            return
-        self.conn.mav.set_position_target_local_ned_send(
-            0,  # time_boot_ms
-            self.conn.target_system,
-            self.conn.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED,
-            _VELOCITY_TYPE_MASK,
-            0,
-            0,
-            0,  # pos (ignored)
-            vx,
-            vy,
-            vz,  # velocity
-            0,
-            0,
-            0,  # accel (ignored)
-            0,
-            yaw_rate,  # yaw, yaw-rate
-        )
-
     # ------------------------------------------------------------------ #
     #  Advanced flight commands
     # ------------------------------------------------------------------ #
@@ -256,6 +211,14 @@ class DroneController:
             yaw_rate,
         )
 
+    # ------------------------------------------------------------------ #
+    #  Yaw-rate state (public property for mission)
+    # ------------------------------------------------------------------ #
+
+    @property
+    def commanded_yaw_rate(self) -> float:
+        return self._commanded_yaw_rate
+
     def perform_rotation(self, angle: float, direction: int) -> float:
         """Execute a blocking rotation.
 
@@ -280,9 +243,11 @@ class DroneController:
         )
 
         # Start rotation
+        self._commanded_yaw_rate = yaw_rate_rad
         self.send_velocity_ned(yaw_rate=yaw_rate_rad, hold_heading=False)
         time.sleep(duration)
         # Stop
+        self._commanded_yaw_rate = 0.0
         self.send_velocity_ned(yaw_rate=0.0, hold_heading=True)
 
         return 1.5  # settling delay
@@ -296,59 +261,3 @@ class DroneController:
         error = target_alt - current_alt
         vz = max(min(error * 1.5, 0.5), -0.5)
         return -vz  # NED: negative Z = up
-
-    # ------------------------------------------------------------------ #
-    #  PID line-following
-    # ------------------------------------------------------------------ #
-
-    def compute_pid(self, error: float) -> float:
-        """Compute lateral velocity correction via PID.
-
-        Parameters
-        ----------
-        error : float
-            Current pixel error (cx_contour - cx_screen).
-
-        Returns
-        -------
-        float
-            Lateral velocity setpoint (m/s), clamped to ``max_lat_vel``.
-        """
-        kp = self._cfg.get("control", "pid_kp", 0.008)
-        ki = self._cfg.get("control", "pid_ki", 0.0001)
-        kd = self._cfg.get("control", "pid_kd", 0.003)
-
-        now = time.monotonic()
-        dt = now - self._last_pid_time if self._last_pid_time is not None else 0.05
-        self._last_pid_time = now
-        dt = max(dt, 1e-6)  # guard against zero-division
-
-        # --- Remember last valid direction for recovery ---
-        if abs(error) > 20:
-            self.last_valid_direction = 1 if error > 0 else -1
-
-        # Proportional
-        p_term = error * kp
-
-        # Integral (with anti-windup clamping)
-        self._integral_error += error * dt
-        self._integral_error = max(min(self._integral_error, 500), -500)
-        i_term = self._integral_error * ki
-
-        # Derivative (on measurement to avoid derivative kick)
-        derivative = (error - self._prev_error) / dt
-        d_term = derivative * kd
-
-        output = p_term + i_term + d_term
-        self._prev_error = error
-
-        # Clamp to maximum lateral velocity
-        max_v = self._cfg.get("flight", "max_lat_vel", 0.3)
-        return float(max(min(output, max_v), -max_v))
-
-    def reset_pid(self) -> None:
-        """Reset the PID integrator, derivative memory, and direction hint."""
-        self._prev_error = 0.0
-        self._integral_error = 0.0
-        self.last_valid_direction = 0
-        self._last_pid_time = None

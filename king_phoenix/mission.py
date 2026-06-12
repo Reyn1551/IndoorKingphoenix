@@ -22,6 +22,8 @@ import time
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
+from king_phoenix.navigator import DIR_E, DIR_N, DIR_S, DIR_W, GRID_MAP
+
 if TYPE_CHECKING:
     from king_phoenix.config import ConfigManager
     from king_phoenix.drone import DroneController
@@ -168,7 +170,12 @@ class MissionController:
 
     def run(self) -> None:
         """Blocking main loop — connect, spin up subsystems, then tick."""
-        self._drone.connect()
+        if self._drone.connect():
+            self._progress("MAVLINK CONNECTED")
+        else:
+            self._progress("MAVLINK CONNECTION FAILED")
+            self._running = False
+            return
         self._t265.start()
         self._running = True
 
@@ -179,7 +186,7 @@ class MissionController:
             # our T265 handler publishes directly, so proceed when ready.
             self._update_telemetry()
             time.sleep(0.5)
-            if self._t265._running:  # type: ignore[union-attr]
+            if self._t265.is_running:
                 break
 
         self._progress("READY: SET TARGET")
@@ -252,7 +259,7 @@ class MissionController:
         # ---- INITIAL_SCAN ----
         elif state == MissionState.INITIAL_SCAN:
             qr = self._bot.detected_qr_buffer
-            if qr and qr in self._nav._grid_map:
+            if qr and qr in GRID_MAP:
                 self._nav.current_node = qr
                 self._nav.current_heading = (0, 1)  # DIR_N
                 self._progress(f"LOCATED: {qr} (RESET N)")
@@ -337,8 +344,6 @@ class MissionController:
                         self._progress("BUILDING FOUND. ORIENTING SOUTH...")
                         time.sleep(0.5)
                         curr = self._nav.current_heading
-                        from king_phoenix.navigator import DIR_E, DIR_N, DIR_S, DIR_W
-
                         angle = 0
                         d = 1
                         if curr == DIR_N:
@@ -487,8 +492,6 @@ class MissionController:
 
         # ---- ALIGN_NORTH ----
         elif state == MissionState.ALIGN_NORTH:
-            from king_phoenix.navigator import DIR_E, DIR_N, DIR_S, DIR_W
-
             curr = self._nav.current_heading
             angle = 0
             d = 1
@@ -570,11 +573,10 @@ class MissionController:
                 vx=vx,
                 vy=vy,
                 vz=vz,
-                yaw_rate=self._drone._commanded_yaw_rate
-                if abs(getattr(self._drone, "_commanded_yaw_rate", 0)) > 0.01
+                yaw_rate=self._drone.commanded_yaw_rate
+                if abs(self._drone.commanded_yaw_rate) > 0.01
                 else 0.0,
-                hold_heading=abs(getattr(self._drone, "_commanded_yaw_rate", 0))
-                <= 0.01,
+                hold_heading=abs(self._drone.commanded_yaw_rate) <= 0.01,
             )
             return
 
@@ -664,10 +666,8 @@ class MissionController:
     # ------------------------------------------------------------------ #
 
     def _reset_pid(self) -> None:
-        self._bot._current_vx = 0.0  # type: ignore[attr-defined]
-        self._bot._current_vy = 0.0  # type: ignore[attr-defined]
-        self._bot.prev_error = 0.0
-        self._bot.integral_error = 0.0
+        self._bot._current_vx = 0.0
+        self._bot._current_vy = 0.0
 
     def _shutdown(self) -> None:
         self._running = False
